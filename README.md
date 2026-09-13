@@ -66,8 +66,31 @@ Disabled by design:
 
 Pending:
 
-- Final dry/wet soil calibration values.
+- Final physical validation of stored dry/wet soil calibration values.
 - Google Apps Script endpoint and cloud telemetry upload.
+
+## Soil Sensor Calibration
+
+Production soil calibration is loaded at boot from the ESP32 NVS flash using the Arduino `Preferences` API. There is no filesystem path for this data.
+
+NVS location:
+
+```text
+namespace: soilcal
+```
+
+Keys:
+
+```text
+valid
+dry
+wet
+version
+```
+
+The production firmware opens the `soilcal` namespace read-only, reads the keys, validates them independently, then closes the Preferences handle. Calibration endpoints at ADC rail values `0` or `4095`, unsupported versions, zero span, insufficient span, missing keys, or a false `valid` flag are treated as invalid. When calibration is missing or invalid, raw soil readings still work, no moisture percentage is fabricated, and irrigation remains blocked.
+
+Normal firmware uploads and reboots usually preserve NVS, so the calibration remains available after changing firmware. Erase-flash operations can remove it. Replacing the physical ESP32 requires recalibration or migration, and replacing the soil probe should trigger recalibration. The resulting percentage is relative soil moisture for this installation, not laboratory volumetric water content.
 
 ## Weather Integration
 

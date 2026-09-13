@@ -14,6 +14,7 @@
 
 #include <HTTPClient.h>
 #include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <esp_arduino_version.h>
@@ -117,6 +118,13 @@ struct FutureLogRecord {
 
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
+constexpr char SOIL_CAL_NAMESPACE[] = "soilcal";
+constexpr char SOIL_CAL_KEY_DRY[] = "dry";
+constexpr char SOIL_CAL_KEY_WET[] = "wet";
+constexpr char SOIL_CAL_KEY_VALID[] = "valid";
+constexpr char SOIL_CAL_KEY_VERSION[] = "version";
+constexpr uint8_t SOIL_CAL_SUPPORTED_VERSION = 1;
+
 WifiProfile wifiProfiles[] = {
   {WIFI_SSID_1, WIFI_PASSWORD_1},
   {WIFI_SSID_2, WIFI_PASSWORD_2},
@@ -129,9 +137,15 @@ SystemState systemState = SystemState::BOOT;
 Status wifiStatus = Status::UNKNOWN;
 WeatherStatus weatherStatus = WeatherStatus::NOT_CHECKED;
 Status cloudStatus = ENABLE_CLOUD_LOGGING ? Status::UNKNOWN : Status::INACTIVE;
-Status soilSensorStatus = SOIL_CALIBRATED ? Status::UNKNOWN : Status::UNCALIBRATED;
+Status soilSensorStatus = Status::UNCALIBRATED;
 Decision lastDecision = Decision::NONE;
 DisplayPage currentDisplayPage = DisplayPage::SYSTEM;
+
+bool soilCalibrationLoaded = false;
+bool soilCalibrationValid = false;
+int soilRawDry = 0;
+int soilRawWet = 0;
+uint8_t soilCalibrationVersion = 0;
 
 char resetReasonText[24] = "UNKNOWN";
 char lcdLineCache[2][17] = {"", ""};
@@ -347,15 +361,89 @@ bool readLocalTime(struct tm* timeInfo) {
   return getLocalTime(timeInfo, 5);
 }
 
+bool isAdcCalibrationEndpointValid(int raw) {
+  return raw > 0 && raw < 4095;
+}
+
+const char* validateStoredSoilCalibration(bool storedValid, int dry, int wet, uint8_t version) {
+  if (!storedValid) return "NVS_VALID_FALSE";
+  if (version != SOIL_CAL_SUPPORTED_VERSION) return "UNSUPPORTED_VERSION";
+  if (dry == wet) return "ZERO_SPAN";
+  if (dry < 0 || dry > 4095 || wet < 0 || wet > 4095) return "ADC_RANGE";
+  if (!isAdcCalibrationEndpointValid(dry) || !isAdcCalibrationEndpointValid(wet)) return "ADC_RAIL_VALUE";
+  if (abs(dry - wet) < MIN_CALIBRATION_SPAN) return "INSUFFICIENT_SPAN";
+  return nullptr;
+}
+
+void setSoilCalibrationInvalid() {
+  soilCalibrationValid = false;
+  soilSensorStatus = Status::UNCALIBRATED;
+  sensors.soilPercent = INVALID_SOIL_PERCENT;
+}
+
+void loadSoilCalibration() {
+  Preferences preferences;
+  if (!preferences.begin(SOIL_CAL_NAMESPACE, true)) {
+    setSoilCalibrationInvalid();
+    soilCalibrationLoaded = false;
+    Serial.println("[SOILCAL] STATUS=MISSING");
+    return;
+  }
+
+  bool hasValid = preferences.isKey(SOIL_CAL_KEY_VALID);
+  bool hasDry = preferences.isKey(SOIL_CAL_KEY_DRY);
+  bool hasWet = preferences.isKey(SOIL_CAL_KEY_WET);
+  bool hasVersion = preferences.isKey(SOIL_CAL_KEY_VERSION);
+
+  bool storedValid = preferences.getBool(SOIL_CAL_KEY_VALID, false);
+  int storedDry = preferences.getInt(SOIL_CAL_KEY_DRY, 0);
+  int storedWet = preferences.getInt(SOIL_CAL_KEY_WET, 0);
+  uint8_t storedVersion = preferences.getUChar(SOIL_CAL_KEY_VERSION, 0);
+  preferences.end();
+
+  soilRawDry = storedDry;
+  soilRawWet = storedWet;
+  soilCalibrationVersion = storedVersion;
+
+  if (!hasValid || !hasDry || !hasWet || !hasVersion) {
+    setSoilCalibrationInvalid();
+    soilCalibrationLoaded = false;
+    Serial.println("[SOILCAL] STATUS=MISSING");
+    return;
+  }
+
+  soilCalibrationLoaded = true;
+  int span = abs(soilRawDry - soilRawWet);
+  Serial.printf("[SOILCAL] NVS loaded version=%u dry=%d wet=%d span=%d\n",
+                soilCalibrationVersion,
+                soilRawDry,
+                soilRawWet,
+                span);
+
+  const char* invalidReason = validateStoredSoilCalibration(storedValid,
+                                                            soilRawDry,
+                                                            soilRawWet,
+                                                            soilCalibrationVersion);
+  if (invalidReason != nullptr) {
+    setSoilCalibrationInvalid();
+    Serial.printf("[SOILCAL] STATUS=INVALID reason=%s\n", invalidReason);
+    return;
+  }
+
+  soilCalibrationValid = true;
+  soilSensorStatus = Status::UNKNOWN;
+  Serial.println("[SOILCAL] STATUS=VALID");
+}
+
 bool calibrationSpanValid() {
-  return abs(SOIL_RAW_DRY - SOIL_RAW_WET) >= MIN_CALIBRATION_SPAN;
+  return soilCalibrationValid && abs(soilRawDry - soilRawWet) >= MIN_CALIBRATION_SPAN;
 }
 
 int soilRawToPercent(int raw) {
-  if (!SOIL_CALIBRATED || !calibrationSpanValid()) return INVALID_SOIL_PERCENT;
-  long denominator = static_cast<long>(SOIL_RAW_WET) - static_cast<long>(SOIL_RAW_DRY);
+  if (!calibrationSpanValid()) return INVALID_SOIL_PERCENT;
+  long denominator = static_cast<long>(soilRawWet) - static_cast<long>(soilRawDry);
   if (denominator == 0) return INVALID_SOIL_PERCENT;
-  long numerator = (static_cast<long>(raw) - static_cast<long>(SOIL_RAW_DRY)) * 100L;
+  long numerator = (static_cast<long>(raw) - static_cast<long>(soilRawDry)) * 100L;
   return constrain(static_cast<int>(numerator / denominator), 0, 100);
 }
 
@@ -399,7 +487,7 @@ void handleSoil(unsigned long now) {
     sensors.soilRawSlow = (sensors.soilRawSlow * 9 + sensors.soilRawFiltered) / 10;
   }
 
-  if (!SOIL_CALIBRATED) {
+  if (!soilCalibrationValid) {
     sensors.soilPercent = INVALID_SOIL_PERCENT;
     soilSensorStatus = Status::UNCALIBRATED;
   } else if (!calibrationSpanValid()) {
@@ -414,7 +502,7 @@ void handleSoil(unsigned long now) {
                 sensors.soilRawInstant,
                 sensors.soilRawFiltered,
                 sensors.soilRawSlow,
-                SOIL_CALIBRATED ? "YES" : "NO");
+                soilCalibrationValid ? "YES" : "NO");
 }
 
 void handleSensors(unsigned long now) {
@@ -811,12 +899,12 @@ void displayPage(DisplayPage page, char* line1, size_t line1Size, char* line2, s
       } else if (soilSensorStatus == Status::FAULT) {
         snprintf(line1, line1Size, "Solo: FALHA");
       } else {
-        snprintf(line1, line1Size, "Solo: OK");
+        snprintf(line1, line1Size, "Umidade solo");
       }
       if (sensors.soilPercent == INVALID_SOIL_PERCENT) {
         snprintf(line2, line2Size, "RAW:%4d", sensors.soilRawFiltered);
       } else {
-        snprintf(line2, line2Size, "RAW:%4d %3d%%", sensors.soilRawFiltered, sensors.soilPercent);
+        snprintf(line2, line2Size, "%3d%%", sensors.soilPercent);
       }
       break;
 
@@ -1025,6 +1113,7 @@ void setup() {
                 ESP_ARDUINO_VERSION_PATCH);
   Serial.println("[BOOT] BOOT button GPIO0 active-low; holding it during reset may enter download mode.");
   Serial.println("[VALVE] CLOSED");
+  loadSoilCalibration();
 
   initWatchdog();
 

@@ -29,9 +29,6 @@ constexpr double WEATHER_LATITUDE = -16.736933184033457;
 constexpr double WEATHER_LONGITUDE = -49.23922053568986;
 constexpr char WEATHER_TIMEZONE[] = "America%2FSao_Paulo";
 
-constexpr bool SOIL_CALIBRATED = false;
-constexpr int SOIL_RAW_DRY = 0;
-constexpr int SOIL_RAW_WET = 0;
 constexpr int MIN_CALIBRATION_SPAN = 250;
 constexpr int INVALID_SOIL_PERCENT = -1;
 constexpr int SOIL_START_IRRIGATION_PERCENT = 30;
