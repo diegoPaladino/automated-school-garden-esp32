@@ -11,10 +11,12 @@ The system is designed to keep running without Wi-Fi or Internet access. Cloud t
 - ESP32-WROOM-32 / ESP32 Dev Module firmware using Arduino Framework and PlatformIO.
 - Cooperative `millis()` scheduling with no blocking Wi-Fi boot loop.
 - Soil-moisture raw ADC reading with median-trimmed filtering and slow smoothing.
+- Runtime soil calibration stored in ESP32 NVS, with BOOT/LCD maintenance workflow.
 - Irrigation finite state machine with fail-safe relay behavior.
-- Open-Meteo weather integration for remote rain, temperature, and humidity data.
+- Open-Meteo weather integration for current temperature/humidity and next-6-hours rain forecast.
 - 16x2 I2C LCD diagnostic pages with low-flicker line caching.
 - Native ESP32 BOOT button on GPIO0 for LCD page navigation.
+- Human-readable uptime on the LCD device page.
 - Watchdog, heartbeat LED, serial diagnostics, and reset-reason reporting.
 - Secret management through an ignored local `include/secrets.h`.
 
@@ -31,6 +33,11 @@ The system is designed to keep running without Wi-Fi or Internet access. Cloud t
 | BOOT button | GPIO0 | Active low, runtime LCD navigation |
 
 Holding BOOT while resetting or powering the ESP32 can enter flashing/download mode. The firmware only uses GPIO0 at runtime with `INPUT_PULLUP`.
+
+Runtime BOOT button behavior:
+
+- Short press: next LCD page.
+- Long press, approximately 5 seconds: enter soil calibration mode.
 
 ## Firmware Architecture
 
@@ -92,6 +99,16 @@ The production firmware opens the `soilcal` namespace read-only, reads the keys,
 
 Normal firmware uploads and reboots usually preserve NVS, so the calibration remains available after changing firmware. Erase-flash operations can remove it. Replacing the physical ESP32 requires recalibration or migration, and replacing the soil probe should trigger recalibration. The resulting percentage is relative soil moisture for this installation, not laboratory volumetric water content.
 
+Production calibration mode is available on the 16x2 LCD:
+
+1. Hold BOOT for about 5 seconds to enter calibration.
+2. With the probe in dry reference condition, short-press BOOT to measure dry soil.
+3. With the probe in wet reference condition, short-press BOOT to measure wet soil.
+4. Review the candidate dry/wet values on the LCD.
+5. Hold BOOT to save the candidate calibration to NVS.
+
+The candidate stays in RAM until the review/save step. Cancelling or producing an invalid candidate preserves the previous NVS calibration. Long-press during the dry-ready or wet-ready screens cancels calibration. During calibration the valve is kept fail-safe closed and automatic irrigation remains disabled.
+
 ## Weather Integration
 
 Open-Meteo remains supported using:
@@ -100,7 +117,9 @@ Open-Meteo remains supported using:
 - Longitude: `-49.23922053568986`
 - Timezone: `America/Sao_Paulo`
 
-Weather values are remote forecast/API data, not local physical sensor measurements.
+Weather values are remote forecast/API data, not local physical sensor measurements. The firmware requests current `temperature_2m` and `relative_humidity_2m`, plus hourly `precipitation_probability` and `precipitation` for the next 6 forecast hours. The displayed/logged `Rain6h` value is the maximum probability and total precipitation across that upcoming 6-hour horizon.
+
+Malformed or incomplete weather responses are reported as API failures instead of being treated as valid readings.
 
 ## Secrets Management
 

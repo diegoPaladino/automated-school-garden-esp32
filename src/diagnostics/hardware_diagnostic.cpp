@@ -299,7 +299,6 @@ void setup() {
   digitalWrite(RELAY_PIN, RELAY_OFF);
 
   pinMode(BUZZER_PIN, OUTPUT);
-  noTone(BUZZER_PIN);
   digitalWrite(BUZZER_PIN, LOW);
 
   Serial.begin(115200);

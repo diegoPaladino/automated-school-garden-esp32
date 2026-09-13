@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-constexpr char FIRMWARE_VERSION[] = "v15.0.0";
+constexpr char FIRMWARE_VERSION[] = "v15.1.0";
 
 constexpr int LED_BUILTIN_PIN = 2;
 constexpr int SOIL_MOISTURE_PIN = 36;

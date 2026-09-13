@@ -12,12 +12,14 @@
 
 #include "config.h"
 
+#include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <esp_arduino_version.h>
+#include <esp_timer.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <stdlib.h>
@@ -74,6 +76,19 @@ enum class DisplayPage : uint8_t {
   COUNT
 };
 
+enum class CalibrationUiState : uint8_t {
+  INACTIVE,
+  DRY_READY,
+  DRY_MEASURING,
+  WET_READY,
+  WET_MEASURING,
+  REVIEW,
+  SAVING,
+  COMPLETE,
+  INVALID,
+  CANCELLED
+};
+
 struct WifiProfile {
   const char* ssid;
   const char* password;
@@ -116,6 +131,15 @@ struct FutureLogRecord {
   const char* resetReason;
 };
 
+struct CalibrationMeasurement {
+  int samples[31] = {};
+  uint8_t count = 0;
+  int minRaw = 4095;
+  int maxRaw = 0;
+  int lastRaw = 0;
+  unsigned long lastSampleMs = 0;
+};
+
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
 constexpr char SOIL_CAL_NAMESPACE[] = "soilcal";
@@ -124,6 +148,10 @@ constexpr char SOIL_CAL_KEY_WET[] = "wet";
 constexpr char SOIL_CAL_KEY_VALID[] = "valid";
 constexpr char SOIL_CAL_KEY_VERSION[] = "version";
 constexpr uint8_t SOIL_CAL_SUPPORTED_VERSION = 1;
+constexpr uint8_t SOIL_CAL_MEASUREMENT_COUNT = 31;
+constexpr unsigned long BUTTON_LONG_PRESS_MS = 5000UL;
+constexpr unsigned long SOIL_CAL_SAMPLE_INTERVAL_MS = 250UL;
+constexpr unsigned long SOIL_CAL_RESULT_HOLD_MS = 5000UL;
 
 WifiProfile wifiProfiles[] = {
   {WIFI_SSID_1, WIFI_PASSWORD_1},
@@ -180,6 +208,17 @@ bool wifiAttemptInProgress = false;
 bool buttonStableLevel = HIGH;
 bool buttonLastReading = HIGH;
 bool buttonPressedArmed = false;
+bool buttonLongHandled = false;
+unsigned long buttonPressedAtMs = 0;
+
+bool buzzerToneStarted = false;
+
+CalibrationUiState calibrationUiState = CalibrationUiState::INACTIVE;
+CalibrationMeasurement calibrationMeasurement;
+int candidateDry = 0;
+int candidateWet = 0;
+unsigned long calibrationStateStartedMs = 0;
+bool calibrationSaveFailed = false;
 
 const char* statusName(Status status) {
   switch (status) {
@@ -275,14 +314,28 @@ bool selectNextConfiguredWifiProfile() {
   return false;
 }
 
+void startBuzzerTone(int frequency) {
+  tone(BUZZER_PIN, frequency);
+  buzzerToneStarted = true;
+  buzzerOn = true;
+}
+
+void stopBuzzer() {
+  if (buzzerToneStarted) {
+    noTone(BUZZER_PIN);
+    buzzerToneStarted = false;
+  }
+  digitalWrite(BUZZER_PIN, LOW);
+  buzzerOn = false;
+}
+
 void closeValve(const char* reason) {
   if (valveOpen) {
     totalValveOpenThisCycleMs += millis() - valveOpenedAtMs;
   }
   digitalWrite(RELAY_PIN, VALVE_CLOSED_LEVEL);
   valveOpen = false;
-  noTone(BUZZER_PIN);
-  buzzerOn = false;
+  stopBuzzer();
   Serial.printf("[VALVE] CLOSED reason=%s\n", reason);
 }
 
@@ -295,8 +348,7 @@ void openValve() {
   digitalWrite(RELAY_PIN, VALVE_OPEN_LEVEL);
   valveOpen = true;
   valveOpenedAtMs = millis();
-  noTone(BUZZER_PIN);
-  buzzerOn = false;
+  stopBuzzer();
   Serial.println("[VALVE] OPEN");
 }
 
@@ -509,6 +561,223 @@ void handleSensors(unsigned long now) {
   handleSoil(now);
 }
 
+bool calibrationModeActive() {
+  return calibrationUiState != CalibrationUiState::INACTIVE;
+}
+
+void setCalibrationUiState(CalibrationUiState nextState, unsigned long now) {
+  calibrationUiState = nextState;
+  calibrationStateStartedMs = now;
+  clearLineCache();
+}
+
+void resetCalibrationMeasurement(unsigned long now) {
+  calibrationMeasurement = CalibrationMeasurement();
+  calibrationMeasurement.lastSampleMs = now - SOIL_CAL_SAMPLE_INTERVAL_MS;
+}
+
+int medianOfCalibrationSamples() {
+  int sorted[SOIL_CAL_MEASUREMENT_COUNT];
+  for (uint8_t i = 0; i < SOIL_CAL_MEASUREMENT_COUNT; i++) {
+    sorted[i] = calibrationMeasurement.samples[i];
+  }
+  sortSamples(sorted, SOIL_CAL_MEASUREMENT_COUNT);
+  return sorted[SOIL_CAL_MEASUREMENT_COUNT / 2];
+}
+
+void finishCalibrationMeasurement(bool dryReference, unsigned long now) {
+  int result = medianOfCalibrationSamples();
+  if (dryReference) {
+    candidateDry = result;
+    Serial.printf("[SOILCAL] DRY_RESULT raw=%d min=%d max=%d\n",
+                  candidateDry,
+                  calibrationMeasurement.minRaw,
+                  calibrationMeasurement.maxRaw);
+    setCalibrationUiState(CalibrationUiState::WET_READY, now);
+    return;
+  }
+
+  candidateWet = result;
+  Serial.printf("[SOILCAL] WET_RESULT raw=%d min=%d max=%d\n",
+                candidateWet,
+                calibrationMeasurement.minRaw,
+                calibrationMeasurement.maxRaw);
+
+  int span = abs(candidateDry - candidateWet);
+  const char* invalidReason = validateStoredSoilCalibration(true,
+                                                            candidateDry,
+                                                            candidateWet,
+                                                            SOIL_CAL_SUPPORTED_VERSION);
+  if (invalidReason == nullptr) {
+    Serial.printf("[SOILCAL] CANDIDATE span=%d status=VALID\n", span);
+  } else {
+    Serial.printf("[SOILCAL] CANDIDATE span=%d status=INVALID reason=%s\n",
+                  span,
+                  invalidReason);
+  }
+
+  if (invalidReason == nullptr) {
+    setCalibrationUiState(CalibrationUiState::REVIEW, now);
+  } else {
+    calibrationSaveFailed = false;
+    setCalibrationUiState(CalibrationUiState::INVALID, now);
+  }
+}
+
+void startCalibrationMeasurement(bool dryReference, unsigned long now) {
+  resetCalibrationMeasurement(now);
+  if (dryReference) {
+    Serial.println("[SOILCAL] DRY_START");
+    setCalibrationUiState(CalibrationUiState::DRY_MEASURING, now);
+  } else {
+    Serial.println("[SOILCAL] WET_START");
+    setCalibrationUiState(CalibrationUiState::WET_MEASURING, now);
+  }
+}
+
+void handleCalibrationMeasurement(unsigned long now) {
+  bool dryReference = calibrationUiState == CalibrationUiState::DRY_MEASURING;
+  bool wetReference = calibrationUiState == CalibrationUiState::WET_MEASURING;
+  if (!dryReference && !wetReference) return;
+  if (now - calibrationMeasurement.lastSampleMs < SOIL_CAL_SAMPLE_INTERVAL_MS) return;
+  calibrationMeasurement.lastSampleMs = now;
+
+  int raw = readSoilFiltered();
+  if (calibrationMeasurement.count < SOIL_CAL_MEASUREMENT_COUNT) {
+    calibrationMeasurement.samples[calibrationMeasurement.count++] = raw;
+    calibrationMeasurement.lastRaw = raw;
+    if (raw < calibrationMeasurement.minRaw) calibrationMeasurement.minRaw = raw;
+    if (raw > calibrationMeasurement.maxRaw) calibrationMeasurement.maxRaw = raw;
+  }
+
+  if (calibrationMeasurement.count >= SOIL_CAL_MEASUREMENT_COUNT) {
+    finishCalibrationMeasurement(dryReference, now);
+  }
+}
+
+bool writeSoilCalibrationToNvs(int dry, int wet) {
+  Preferences preferences;
+  if (!preferences.begin(SOIL_CAL_NAMESPACE, false)) return false;
+
+  bool ok = true;
+  ok = preferences.putBool(SOIL_CAL_KEY_VALID, false) > 0 && ok;
+  ok = preferences.putInt(SOIL_CAL_KEY_DRY, dry) > 0 && ok;
+  ok = preferences.putInt(SOIL_CAL_KEY_WET, wet) > 0 && ok;
+  ok = preferences.putUChar(SOIL_CAL_KEY_VERSION, SOIL_CAL_SUPPORTED_VERSION) > 0 && ok;
+  if (ok) {
+    ok = preferences.putBool(SOIL_CAL_KEY_VALID, true) > 0;
+  }
+  preferences.end();
+  return ok;
+}
+
+bool saveCalibrationCandidate() {
+  int previousDry = soilRawDry;
+  int previousWet = soilRawWet;
+  bool previousValid = soilCalibrationValid;
+
+  if (!writeSoilCalibrationToNvs(candidateDry, candidateWet)) {
+    if (previousValid) {
+      writeSoilCalibrationToNvs(previousDry, previousWet);
+      loadSoilCalibration();
+    }
+    return false;
+  }
+
+  loadSoilCalibration();
+  return soilCalibrationValid &&
+         soilRawDry == candidateDry &&
+         soilRawWet == candidateWet &&
+         soilCalibrationVersion == SOIL_CAL_SUPPORTED_VERSION;
+}
+
+void enterSoilCalibrationMode(unsigned long now) {
+  closeValve("SOIL_CAL");
+  stopBuzzer();
+  candidateDry = 0;
+  candidateWet = 0;
+  calibrationSaveFailed = false;
+  Serial.println("[SOILCAL] MODE_ENTER");
+  setCalibrationUiState(CalibrationUiState::DRY_READY, now);
+}
+
+void cancelSoilCalibration(unsigned long now) {
+  closeValve("SOIL_CAL_CANCEL");
+  stopBuzzer();
+  Serial.println("[SOILCAL] CALIBRATION_CANCELLED");
+  setCalibrationUiState(CalibrationUiState::CANCELLED, now);
+}
+
+void exitSoilCalibrationMode(unsigned long now) {
+  calibrationUiState = CalibrationUiState::INACTIVE;
+  manualDisplayUntilMs = now + MANUAL_DISPLAY_HOLD_MS;
+  lastDisplayRotationMs = now;
+  clearLineCache();
+}
+
+void handleCalibrationLongPress(unsigned long now) {
+  switch (calibrationUiState) {
+    case CalibrationUiState::DRY_READY:
+    case CalibrationUiState::WET_READY:
+      cancelSoilCalibration(now);
+      break;
+
+    case CalibrationUiState::REVIEW:
+      setCalibrationUiState(CalibrationUiState::SAVING, now);
+      calibrationSaveFailed = !saveCalibrationCandidate();
+      if (calibrationSaveFailed) {
+        Serial.println("[SOILCAL] SAVE_FAILED");
+        setCalibrationUiState(CalibrationUiState::INVALID, now);
+      } else {
+        Serial.println("[SOILCAL] SAVE_OK");
+        setCalibrationUiState(CalibrationUiState::COMPLETE, now);
+      }
+      break;
+
+    case CalibrationUiState::COMPLETE:
+    case CalibrationUiState::INVALID:
+    case CalibrationUiState::CANCELLED:
+      exitSoilCalibrationMode(now);
+      break;
+
+    default:
+      break;
+  }
+}
+
+void handleCalibrationShortPress(unsigned long now) {
+  switch (calibrationUiState) {
+    case CalibrationUiState::DRY_READY:
+      startCalibrationMeasurement(true, now);
+      break;
+
+    case CalibrationUiState::WET_READY:
+      startCalibrationMeasurement(false, now);
+      break;
+
+    case CalibrationUiState::COMPLETE:
+    case CalibrationUiState::INVALID:
+    case CalibrationUiState::CANCELLED:
+      exitSoilCalibrationMode(now);
+      break;
+
+    default:
+      break;
+  }
+}
+
+void handleCalibrationMode(unsigned long now) {
+  if (!calibrationModeActive()) return;
+  handleCalibrationMeasurement(now);
+
+  if ((calibrationUiState == CalibrationUiState::COMPLETE ||
+       calibrationUiState == CalibrationUiState::INVALID ||
+       calibrationUiState == CalibrationUiState::CANCELLED) &&
+      now - calibrationStateStartedMs >= SOIL_CAL_RESULT_HOLD_MS) {
+    exitSoilCalibrationMode(now);
+  }
+}
+
 void beginWifiAttempt(unsigned long now) {
   if (!selectNextConfiguredWifiProfile()) {
     wifiStatus = Status::OFFLINE;
@@ -595,66 +864,90 @@ void timestampNow(char* buffer, size_t size) {
   }
 }
 
-int parseJsonNumberArray(const char* json, const char* key, float* values, int maxValues) {
-  const char* keyPos = strstr(json, key);
-  if (keyPos == nullptr) return 0;
-
-  const char* cursor = strchr(keyPos, '[');
-  if (cursor == nullptr) return 0;
-  cursor++;
-
-  int count = 0;
-  while (*cursor != '\0' && *cursor != ']' && count < maxValues) {
-    while (*cursor != '\0' && *cursor != ']' &&
-           *cursor != '-' && *cursor != '.' &&
-           (*cursor < '0' || *cursor > '9')) {
-      cursor++;
-    }
-
-    if (*cursor == '\0' || *cursor == ']') break;
-
-    char* endPtr = nullptr;
-    float value = strtof(cursor, &endPtr);
-    if (endPtr == cursor) break;
-
-    values[count++] = value;
-    cursor = endPtr;
+void formatHumanUptime(char* buffer, size_t size) {
+  uint64_t seconds = static_cast<uint64_t>(esp_timer_get_time() / 1000000ULL);
+  uint64_t minutes = seconds / 60ULL;
+  if (minutes < 60ULL) {
+    snprintf(buffer, size, "Up: %llumin", minutes);
+    return;
   }
 
-  return count;
+  uint64_t hours = minutes / 60ULL;
+  uint64_t remainingMinutes = minutes % 60ULL;
+  if (hours < 24ULL) {
+    snprintf(buffer, size, "Up: %02lluh%02llum", hours, remainingMinutes);
+    return;
+  }
+
+  uint64_t days = hours / 24ULL;
+  uint64_t remainingHours = hours % 24ULL;
+  snprintf(buffer, size, "Up: %02llud%02lluh", days, remainingHours);
+}
+
+bool readJsonFloat(JsonVariantConst value, float* out) {
+  if (value.isNull() || !value.is<float>()) return false;
+  float parsed = value.as<float>();
+  if (!isfinite(parsed)) return false;
+  *out = parsed;
+  return true;
 }
 
 bool parseOpenMeteo(const String& payload) {
-  const char* json = payload.c_str();
-  float probabilities[6];
-  float precipitations[6];
-  float temperatures[1];
-  float humidities[1];
+  JsonDocument filter;
+  filter["current"]["temperature_2m"] = true;
+  filter["current"]["relative_humidity_2m"] = true;
+  filter["hourly"]["precipitation_probability"] = true;
+  filter["hourly"]["precipitation"] = true;
 
-  int probabilityCount = parseJsonNumberArray(json, "\"precipitation_probability\"", probabilities, 6);
-  int precipitationCount = parseJsonNumberArray(json, "\"precipitation\"", precipitations, 6);
-  int count = min(probabilityCount, precipitationCount);
-  if (count <= 0) return false;
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+  if (error) {
+    Serial.printf("[WEATHER] JSON_ERROR %s\n", error.c_str());
+    return false;
+  }
+
+  JsonObjectConst current = doc["current"].as<JsonObjectConst>();
+  JsonObjectConst hourly = doc["hourly"].as<JsonObjectConst>();
+  JsonArrayConst probabilities = hourly["precipitation_probability"].as<JsonArrayConst>();
+  JsonArrayConst precipitations = hourly["precipitation"].as<JsonArrayConst>();
+
+  if (current.isNull() || hourly.isNull() ||
+      probabilities.isNull() || precipitations.isNull() ||
+      probabilities.size() < 6 || precipitations.size() < 6) {
+    return false;
+  }
+
+  float temperature = NAN;
+  float humidity = NAN;
+  if (!readJsonFloat(current["temperature_2m"], &temperature) ||
+      !readJsonFloat(current["relative_humidity_2m"], &humidity)) {
+    return false;
+  }
+  if (humidity < 0.0f || humidity > 100.0f) return false;
 
   int maxProbability = 0;
   float totalMm = 0.0f;
+  for (uint8_t i = 0; i < 6; i++) {
+    float probabilityValue = NAN;
+    float precipitationValue = NAN;
+    if (!readJsonFloat(probabilities[i], &probabilityValue) ||
+        !readJsonFloat(precipitations[i], &precipitationValue)) {
+      return false;
+    }
+    if (probabilityValue < 0.0f || probabilityValue > 100.0f ||
+        precipitationValue < 0.0f) {
+      return false;
+    }
 
-  for (int i = 0; i < count; i++) {
-    int probability = constrain(static_cast<int>(probabilities[i] + 0.5f), 0, 100);
+    int probability = constrain(static_cast<int>(probabilityValue + 0.5f), 0, 100);
     if (probability > maxProbability) maxProbability = probability;
-    totalMm += precipitations[i];
+    totalMm += precipitationValue;
   }
 
   weather.maxRainProbabilityNext6h = maxProbability;
   weather.totalRainMmNext6h = totalMm;
-
-  if (parseJsonNumberArray(json, "\"temperature_2m\"", temperatures, 1) == 1) {
-    weather.remoteTemperature2m = temperatures[0];
-  }
-  if (parseJsonNumberArray(json, "\"relative_humidity_2m\"", humidities, 1) == 1) {
-    weather.remoteRelativeHumidity2m = humidities[0];
-  }
-
+  weather.remoteTemperature2m = temperature;
+  weather.remoteRelativeHumidity2m = humidity;
   return true;
 }
 
@@ -670,9 +963,9 @@ void handleWeather(unsigned long now) {
   if (lastWeatherAttemptMs != 0 && now - lastWeatherAttemptMs < interval) return;
   lastWeatherAttemptMs = now;
 
-  char url[384];
+  char url[448];
   snprintf(url, sizeof(url),
-           "https://api.open-meteo.com/v1/forecast?latitude=%.12f&longitude=%.12f&hourly=precipitation_probability,precipitation,temperature_2m,relative_humidity_2m&forecast_days=1&timezone=%s",
+           "https://api.open-meteo.com/v1/forecast?latitude=%.12f&longitude=%.12f&current=temperature_2m,relative_humidity_2m&hourly=precipitation_probability,precipitation&forecast_hours=6&timezone=%s",
            WEATHER_LATITUDE,
            WEATHER_LONGITUDE,
            WEATHER_TIMEZONE);
@@ -739,8 +1032,7 @@ void startIrrigationCycle(unsigned long now) {
   currentPulse = 0;
   totalValveOpenThisCycleMs = 0;
   lastDecision = Decision::START_PRE_IRRIGATION;
-  noTone(BUZZER_PIN);
-  buzzerOn = false;
+  stopBuzzer();
   buzzerAlt = false;
   buzzerToggleMs = now;
   setState(SystemState::PRE_IRRIGATION);
@@ -765,22 +1057,19 @@ void finishIrrigationCycle(const char* reason) {
 void handleBuzzer(unsigned long now) {
   if (systemState != SystemState::PRE_IRRIGATION) {
     if (buzzerOn) {
-      noTone(BUZZER_PIN);
-      buzzerOn = false;
+      stopBuzzer();
     }
     return;
   }
 
   if (buzzerOn) {
     if (now - buzzerToggleMs >= BUZZ_ON_MS) {
-      noTone(BUZZER_PIN);
-      buzzerOn = false;
+      stopBuzzer();
       buzzerToggleMs = now;
     }
   } else if (now - buzzerToggleMs >= BUZZ_OFF_MS) {
-    tone(BUZZER_PIN, buzzerAlt ? BUZZ_FREQ_A : BUZZ_FREQ_B);
+    startBuzzerTone(buzzerAlt ? BUZZ_FREQ_A : BUZZ_FREQ_B);
     buzzerAlt = !buzzerAlt;
-    buzzerOn = true;
     buzzerToggleMs = now;
   }
 }
@@ -821,8 +1110,7 @@ void handleIrrigation(unsigned long now) {
 
     case SystemState::PRE_IRRIGATION:
       if (now - stateStartedMs >= PRE_IRRIGATION_MS) {
-        noTone(BUZZER_PIN);
-        buzzerOn = false;
+        stopBuzzer();
         startValvePulse();
       }
       break;
@@ -890,7 +1178,7 @@ void displayPage(DisplayPage page, char* line1, size_t line1Size, char* line2, s
   switch (page) {
     case DisplayPage::SYSTEM:
       formatSystemLine(line1, line1Size);
-      snprintf(line2, line2Size, "Irrig: %s", valveOpen ? "ON" : "OFF");
+      snprintf(line2, line2Size, "Valvula: %s", valveOpen ? "ON" : "OFF");
       break;
 
     case DisplayPage::SOIL:
@@ -941,8 +1229,8 @@ void displayPage(DisplayPage page, char* line1, size_t line1Size, char* line2, s
       break;
 
     case DisplayPage::DEVICE:
+      formatHumanUptime(line2, line2Size);
       snprintf(line1, line1Size, "FW %s", FIRMWARE_VERSION);
-      snprintf(line2, line2Size, "Up:%lus %s", millis() / 1000UL, resetReasonText);
       break;
 
     default:
@@ -952,9 +1240,78 @@ void displayPage(DisplayPage page, char* line1, size_t line1Size, char* line2, s
   }
 }
 
+void displayCalibrationPage(char* line1, size_t line1Size, char* line2, size_t line2Size) {
+  switch (calibrationUiState) {
+    case CalibrationUiState::DRY_READY:
+      snprintf(line1, line1Size, "SECO PRONTO?");
+      snprintf(line2, line2Size, "Toque BOOT");
+      break;
+
+    case CalibrationUiState::DRY_MEASURING:
+      snprintf(line1, line1Size, "MEDINDO SECO");
+      snprintf(line2, line2Size, "%02u/%02u RAW:%4d",
+               calibrationMeasurement.count,
+               SOIL_CAL_MEASUREMENT_COUNT,
+               calibrationMeasurement.lastRaw);
+      break;
+
+    case CalibrationUiState::WET_READY:
+      snprintf(line1, line1Size, "SOLO UMIDO");
+      snprintf(line2, line2Size, "Toque BOOT");
+      break;
+
+    case CalibrationUiState::WET_MEASURING:
+      snprintf(line1, line1Size, "MEDINDO UMIDO");
+      snprintf(line2, line2Size, "%02u/%02u RAW:%4d",
+               calibrationMeasurement.count,
+               SOIL_CAL_MEASUREMENT_COUNT,
+               calibrationMeasurement.lastRaw);
+      break;
+
+    case CalibrationUiState::REVIEW:
+      snprintf(line1, line1Size, "D%04d W%04d", candidateDry, candidateWet);
+      snprintf(line2, line2Size, "Segure p/salvar");
+      break;
+
+    case CalibrationUiState::SAVING:
+      snprintf(line1, line1Size, "SALVANDO CAL");
+      snprintf(line2, line2Size, "Aguarde");
+      break;
+
+    case CalibrationUiState::COMPLETE:
+      snprintf(line1, line1Size, "CAL SALVA");
+      snprintf(line2, line2Size, "D%04d W%04d", soilRawDry, soilRawWet);
+      break;
+
+    case CalibrationUiState::INVALID:
+      snprintf(line1, line1Size, "%s", calibrationSaveFailed ? "SALVAR FALHOU" : "CAL INVALIDA");
+      snprintf(line2, line2Size, "Anterior mantida");
+      break;
+
+    case CalibrationUiState::CANCELLED:
+      snprintf(line1, line1Size, "CAL CANCELADA");
+      snprintf(line2, line2Size, "Sem alteracao");
+      break;
+
+    default:
+      snprintf(line1, line1Size, "CALIBRACAO");
+      snprintf(line2, line2Size, "SOLO");
+      break;
+  }
+}
+
 void handleDisplay(unsigned long now) {
   if (now - lastDisplayRefreshMs < DISPLAY_REFRESH_MS) return;
   lastDisplayRefreshMs = now;
+
+  if (calibrationModeActive()) {
+    char line1[17];
+    char line2[17];
+    displayCalibrationPage(line1, sizeof(line1), line2, sizeof(line2));
+    printLcdLine(0, line1);
+    printLcdLine(1, line2);
+    return;
+  }
 
   if (systemState == SystemState::BOOT) {
     printLcdLine(0, "Horta ESP32");
@@ -1001,6 +1358,22 @@ void cycleDisplayPage(unsigned long now) {
   Serial.printf("[DISPLAY] page=%s\n", displayPageName(currentDisplayPage));
 }
 
+void handleButtonShortPress(unsigned long now) {
+  if (calibrationModeActive()) {
+    handleCalibrationShortPress(now);
+  } else {
+    cycleDisplayPage(now);
+  }
+}
+
+void handleButtonLongPress(unsigned long now) {
+  if (calibrationModeActive()) {
+    handleCalibrationLongPress(now);
+  } else {
+    enterSoilCalibrationMode(now);
+  }
+}
+
 void handleButton(unsigned long now) {
   bool reading = digitalRead(BOOT_BUTTON_PIN);
   if (reading != buttonLastReading) {
@@ -1009,17 +1382,33 @@ void handleButton(unsigned long now) {
   }
 
   if (now - lastButtonTransitionMs < BUTTON_DEBOUNCE_MS) return;
-  if (reading == buttonStableLevel) return;
 
-  buttonStableLevel = reading;
-  if (buttonStableLevel == BOOT_BUTTON_ACTIVE_LEVEL) {
-    buttonPressedArmed = true;
+  if (reading != buttonStableLevel) {
+    buttonStableLevel = reading;
+    if (buttonStableLevel == BOOT_BUTTON_ACTIVE_LEVEL) {
+      buttonPressedArmed = true;
+      buttonLongHandled = false;
+      buttonPressedAtMs = now;
+      return;
+    }
+
+    if (buttonPressedArmed) {
+      bool wasLongHandled = buttonLongHandled;
+      buttonPressedArmed = false;
+      buttonLongHandled = false;
+      if (!wasLongHandled) {
+        handleButtonShortPress(now);
+      }
+    }
     return;
   }
 
-  if (buttonPressedArmed) {
-    buttonPressedArmed = false;
-    cycleDisplayPage(now);
+  if (buttonStableLevel == BOOT_BUTTON_ACTIVE_LEVEL &&
+      buttonPressedArmed &&
+      !buttonLongHandled &&
+      now - buttonPressedAtMs >= BUTTON_LONG_PRESS_MS) {
+    buttonLongHandled = true;
+    handleButtonLongPress(now);
   }
 }
 
@@ -1120,7 +1509,7 @@ void setup() {
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   digitalWrite(LED_BUILTIN_PIN, LED_ON_LEVEL);
   pinMode(BUZZER_PIN, OUTPUT);
-  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   buttonStableLevel = digitalRead(BOOT_BUTTON_PIN);
   buttonLastReading = buttonStableLevel;
@@ -1159,6 +1548,7 @@ void loop() {
   handleWeather(now);
   handleIrrigation(now);
   handleButton(now);
+  handleCalibrationMode(now);
   handleDisplay(now);
   handleCloudLogging(now);
   handleHeartbeat(now);
