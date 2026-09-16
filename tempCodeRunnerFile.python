@@ -1,0 +1,127 @@
+import requests
+from datetime import datetime
+
+# ==========================================================
+# LOCALIZAÇÃO
+# Escola / região de Aparecida de Goiânia - GO
+# ==========================================================
+
+LATITUDE = -16.73890993855689
+LONGITUDE = -49.23831878382262
+
+
+# ==========================================================
+# API OPEN-METEO
+# ==========================================================
+
+url = "https://api.open-meteo.com/v1/forecast"
+
+parametros = {
+    "latitude": LATITUDE,
+    "longitude": LONGITUDE,
+
+    # Condições atuais
+    "current": [
+        "temperature_2m",
+        "relative_humidity_2m",
+        "precipitation"
+    ],
+
+    # Previsão horária
+    "hourly": [
+        "temperature_2m",
+        "relative_humidity_2m",
+        "precipitation_probability",
+        "precipitation"
+    ],
+
+    # Horário local
+    "timezone": "America/Sao_Paulo",
+
+    # Quantidade de dias retornados
+    "forecast_days": 2
+}
+
+
+# ==========================================================
+# CONSULTA
+# ==========================================================
+
+try:
+    resposta = requests.get(url, params=parametros, timeout=10)
+    resposta.raise_for_status()
+
+    dados = resposta.json()
+
+    atual = dados["current"]
+    horario = dados["hourly"]
+
+    # ======================================================
+    # CONDIÇÕES ATUAIS
+    # ======================================================
+
+    print("\n" + "=" * 55)
+    print("          CONDIÇÕES METEOROLÓGICAS ATUAIS")
+    print("=" * 55)
+
+    print(f"Localização : {LATITUDE}, {LONGITUDE}")
+    print(f"Horário     : {atual['time']}")
+    print(f"Temperatura : {atual['temperature_2m']} °C")
+    print(f"Umidade     : {atual['relative_humidity_2m']} %")
+    print(f"Precipitação: {atual['precipitation']} mm")
+
+    # ======================================================
+    # ENCONTRAR HORÁRIO ATUAL NA PREVISÃO
+    # ======================================================
+
+    agora = datetime.fromisoformat(atual["time"])
+
+    inicio = 0
+
+    for i, horario_api in enumerate(horario["time"]):
+        data_hora = datetime.fromisoformat(horario_api)
+
+        if data_hora >= agora:
+            inicio = i
+            break
+
+    # ======================================================
+    # PREVISÃO DAS PRÓXIMAS 12 HORAS
+    # ======================================================
+
+    print("\n" + "=" * 75)
+    print("                    PREVISÃO - PRÓXIMAS 12 HORAS")
+    print("=" * 75)
+
+    print(
+        f"{'HORÁRIO':<18}"
+        f"{'TEMP.':<10}"
+        f"{'UMIDADE':<12}"
+        f"{'CHUVA %':<12}"
+        f"{'CHUVA mm':<10}"
+    )
+
+    print("-" * 75)
+
+    for i in range(inicio, min(inicio + 12, len(horario["time"]))):
+
+        data_hora = datetime.fromisoformat(horario["time"][i])
+
+        temperatura = horario["temperature_2m"][i]
+        umidade = horario["relative_humidity_2m"][i]
+        chance_chuva = horario["precipitation_probability"][i]
+        chuva_mm = horario["precipitation"][i]
+
+        print(
+            f"{data_hora.strftime('%d/%m %H:%M'):<18}"
+            f"{temperatura:<10.1f}"
+            f"{umidade:<12}"
+            f"{chance_chuva:<12}"
+            f"{chuva_mm:<10.1f}"
+        )
+
+except requests.exceptions.RequestException as erro:
+    print(f"\nErro ao consultar a previsão do tempo: {erro}")
+
+except KeyError as erro:
+    print(f"\nErro ao interpretar os dados da API: {erro}")

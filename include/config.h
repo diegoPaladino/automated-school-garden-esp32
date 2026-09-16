@@ -3,7 +3,7 @@
 #include <Arduino.h>
 #include <DHT.h>
 
-constexpr char FIRMWARE_VERSION[] = "v15.2.0";
+constexpr char FIRMWARE_VERSION[] = "v15.3.0";
 
 constexpr int LED_BUILTIN_PIN = 2;
 constexpr int SOIL_MOISTURE_PIN = 36;
@@ -29,10 +29,10 @@ constexpr uint8_t LCD_ROWS = 2;
 constexpr bool ENABLE_CLOUD_LOGGING = false;
 constexpr bool ENABLE_AUTOMATIC_IRRIGATION = false;
 
-constexpr double WEATHER_LATITUDE = -16.736742064908807;
-constexpr double WEATHER_LONGITUDE = -49.23936484532197;
+constexpr char WEATHER_LATITUDE[] = "-16.736742064908807";
+constexpr char WEATHER_LONGITUDE[] = "-49.23936484532197";
 constexpr float WEATHER_ELEVATION_M = 808.0f;
-constexpr char WEATHER_TIMEZONE[] = "America%2FSao_Paulo";
+constexpr char WEATHER_TIMEZONE[] = "America/Sao_Paulo";
 
 constexpr int MIN_CALIBRATION_SPAN = 250;
 constexpr int INVALID_SOIL_PERCENT = -1;

@@ -14,10 +14,10 @@ The system is designed to keep running without Wi-Fi or Internet access. Cloud t
 - Local DHT11 environmental readings for temperature and air humidity.
 - Runtime soil calibration stored in ESP32 NVS, with BOOT/LCD maintenance workflow.
 - Irrigation finite state machine with fail-safe relay behavior.
-- Open-Meteo weather integration for current temperature/humidity and next-6-hours rain forecast.
+- Open-Meteo weather integration for remote/modelled current temperature/humidity and next-6-hours rain forecast.
 - 16x2 I2C LCD with PUBLIC and DEVELOPER page rotations and low-flicker line caching.
-- Native ESP32 BOOT button on GPIO0 for LCD navigation, display-mode toggle, and soil calibration.
-- Human-readable uptime on the LCD device page.
+- Native ESP32 BOOT button on GPIO0 for LCD navigation, display-mode toggle, soil calibration, and arming the manual valve test.
+- Human-readable uptime on DEVELOPER LCD pages.
 - Watchdog, heartbeat LED, serial diagnostics, and reset-reason reporting.
 - Secret management through an ignored local `include/secrets.h`.
 
@@ -38,9 +38,11 @@ Holding BOOT while resetting or powering the ESP32 can enter flashing/download m
 
 Runtime BOOT button behavior:
 
-- Short press: next LCD page.
-- Three quick short presses: toggle PUBLIC / DEVELOPER LCD mode.
-- Long press, approximately 5 seconds: enter soil calibration mode.
+- Short press under 1.5 seconds: next LCD page.
+- Three quick short presses, each separated by about 600 ms and completed within about 2 seconds: toggle PUBLIC / DEVELOPER LCD mode.
+- Medium press from 1.5 seconds to under 3 seconds: safely ignored.
+- Long press from 3 seconds to under 8 seconds: enter soil calibration mode.
+- Very long press of 8 seconds or more: arm manual valve test only; a second short click within 10 seconds confirms a maximum 3-second valve test, and any BOOT press during the test closes the valve immediately.
 
 DEVELOPER mode is runtime-only and is not persisted to NVS. Every reset starts in PUBLIC mode. If no BOOT interaction occurs for about 2 minutes while in DEVELOPER mode, the LCD automatically returns to PUBLIC mode.
 
@@ -61,18 +63,16 @@ The main loop is organized around small cooperative handlers:
 
 Irrigation states include boot, idle, pre-irrigation warning, irrigating, soak wait, cooldown, and sensor fault. Uncertain conditions fail safe with the valve closed.
 
-The DHT11 is sampled cooperatively about once every 60 seconds. Invalid DHT values are never converted to zero, never reset the ESP32, and never block irrigation. If the sensor fails, the last valid values remain internal telemetry but the public LCD shows `Indisponivel` until fresh data is available.
+The DHT11 is sampled cooperatively about once every 5 seconds. Invalid DHT values are never converted to zero, never reset the ESP32, and never block irrigation. If the sensor fails, the last valid values remain internal telemetry but the public LCD shows `INDISPONIVEL` until fresh data is available.
 
 LCD PUBLIC mode is intended for students, teachers, families, and visitors:
 
-- `Horta: NORMAL` / valve state.
-- `Umidade do solo` as a calibrated percentage, or calibration guidance.
-- `Temperatura` from the local DHT11.
-- `Umidade do ar` from the local DHT11.
-- `Previsao 6h` with rain probability from Open-Meteo.
-- `Sistema ativo` using the human-readable uptime formatter.
+- `HORTA: NORMAL` / `VALVULA: OFF`.
+- `UMIDADE SOLO` as a calibrated percentage, or calibration guidance.
+- `AMBIENTE LOCAL` with local DHT11 temperature and relative humidity on one page.
+- `PREVISAO 6H` with Open-Meteo rain probability and, when it fits, total forecast precipitation.
 
-LCD DEVELOPER mode exposes maintenance diagnostics such as Wi-Fi/RSSI, raw soil ADC values, DHT status and local values, Open-Meteo remote values, cloud placeholder status, firmware version, uptime, system state, decision state, and automatic-irrigation state.
+LCD DEVELOPER mode exposes maintenance diagnostics such as Wi-Fi/RSSI, connected SSID, raw/filtered soil ADC values, DHT status and local values, Open-Meteo remote values, Open-Meteo grid coordinates, rain probability/mm, cloud placeholder status, firmware version, reset reason, uptime, system state, decision state, valve state, and automatic-irrigation state.
 
 ## Safety / Fail-Safe Design
 
@@ -119,7 +119,7 @@ Normal firmware uploads and reboots usually preserve NVS, so the calibration rem
 
 Production calibration mode is available on the 16x2 LCD:
 
-1. Hold BOOT for about 5 seconds to enter calibration.
+1. Hold BOOT for 3 to under 8 seconds to enter calibration.
 2. With the probe in dry reference condition, short-press BOOT to measure dry soil.
 3. With the probe in wet reference condition, short-press BOOT to measure wet soil.
 4. Review the candidate dry/wet values on the LCD.
@@ -136,11 +136,25 @@ Local environmental readings and remote weather data are intentionally separate:
 
 Open-Meteo remains supported using:
 
-- Latitude: `-16.736933184033457`
-- Longitude: `-49.23922053568986`
+- Latitude: `-16.736742064908807`
+- Longitude: `-49.23936484532197`
+- Elevation: `808 m`
 - Timezone: `America/Sao_Paulo`
 
-Weather values are remote forecast/API data, not local physical sensor measurements. The firmware requests current `temperature_2m` and `relative_humidity_2m`, plus hourly `precipitation_probability` and `precipitation` for the next 6 forecast hours. The displayed/logged `Rain6h` value is the maximum probability and total precipitation across that upcoming 6-hour horizon.
+Weather values are remote forecast/API data, not local physical sensor measurements. The DHT11 remains the local sensor and is not calibrated against Internet weather. The firmware requests current `temperature_2m` and `relative_humidity_2m`, plus hourly `precipitation_probability` and `precipitation` for `forecast_hours=6`. The public `PREVISAO 6H` page shows unavailable weather as `INDISPONIVEL`, which is distinct from a valid 0% / 0.0 mm forecast. Developer diagnostics retain the response grid latitude, longitude, elevation, timezone, UTC offset, remote temperature/humidity, rain probability, and rain millimeters.
+
+The request structure is:
+
+```text
+https://api.open-meteo.com/v1/forecast
+  ?latitude=-16.736742064908807
+  &longitude=-49.23936484532197
+  &elevation=808
+  &current=temperature_2m,relative_humidity_2m
+  &hourly=precipitation_probability,precipitation
+  &forecast_hours=6
+  &timezone=America/Sao_Paulo
+```
 
 Malformed or incomplete weather responses are reported as API failures instead of being treated as valid readings.
 

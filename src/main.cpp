@@ -75,10 +75,8 @@ enum class DisplayMode : uint8_t {
 enum class PublicDisplayPage : uint8_t {
   SYSTEM,
   SOIL,
-  TEMPERATURE,
-  AIR_HUMIDITY,
+  LOCAL_ENVIRONMENT,
   WEATHER,
-  UPTIME,
   COUNT
 };
 
@@ -86,10 +84,13 @@ enum class DeveloperDisplayPage : uint8_t {
   SYSTEM,
   SOIL_RAW,
   WIFI,
+  WIFI_SSID,
   DHT,
   WEATHER,
+  WEATHER_GRID,
   CLOUD,
   DEVICE,
+  RESET_UPTIME,
   COUNT
 };
 
@@ -131,6 +132,14 @@ struct WeatherData {
   float totalRainMmNext6h = 0.0f;
   float remoteTemperature2m = NAN;
   float remoteRelativeHumidity2m = NAN;
+};
+
+struct WeatherResponseLocation {
+  float latitude = NAN;
+  float longitude = NAN;
+  float elevation = NAN;
+  long utcOffsetSeconds = 0;
+  char timezone[32] = "";
 };
 
 struct FutureLogRecord {
@@ -191,6 +200,7 @@ WifiProfile wifiProfiles[] = {
 
 SensorData sensors;
 WeatherData weather;
+WeatherResponseLocation weatherGrid;
 
 SystemState systemState = SystemState::BOOT;
 Status wifiStatus = Status::UNKNOWN;
@@ -308,10 +318,8 @@ const char* publicDisplayPageName(PublicDisplayPage page) {
   switch (page) {
     case PublicDisplayPage::SYSTEM: return "SYSTEM";
     case PublicDisplayPage::SOIL: return "SOIL";
-    case PublicDisplayPage::TEMPERATURE: return "TEMPERATURE";
-    case PublicDisplayPage::AIR_HUMIDITY: return "AIR_HUMIDITY";
+    case PublicDisplayPage::LOCAL_ENVIRONMENT: return "LOCAL_ENVIRONMENT";
     case PublicDisplayPage::WEATHER: return "WEATHER";
-    case PublicDisplayPage::UPTIME: return "UPTIME";
     default: return "UNKNOWN";
   }
 }
@@ -321,10 +329,13 @@ const char* developerDisplayPageName(DeveloperDisplayPage page) {
     case DeveloperDisplayPage::SYSTEM: return "SYSTEM";
     case DeveloperDisplayPage::SOIL_RAW: return "SOIL_RAW";
     case DeveloperDisplayPage::WIFI: return "WIFI";
+    case DeveloperDisplayPage::WIFI_SSID: return "WIFI_SSID";
     case DeveloperDisplayPage::DHT: return "DHT";
     case DeveloperDisplayPage::WEATHER: return "WEATHER";
+    case DeveloperDisplayPage::WEATHER_GRID: return "WEATHER_GRID";
     case DeveloperDisplayPage::CLOUD: return "CLOUD";
     case DeveloperDisplayPage::DEVICE: return "DEVICE";
+    case DeveloperDisplayPage::RESET_UPTIME: return "RESET_UPTIME";
     default: return "UNKNOWN";
   }
 }
@@ -690,7 +701,7 @@ void handleDht(unsigned long now) {
     sensors.localRelativeHumidity = constrain(humidity + DHT_HUMIDITY_OFFSET_PERCENT, 0.0f, 100.0f);
     lastDhtSuccessMs = now;
     dhtStatus = Status::OK;
-    Serial.printf("[DHT] Tlocal=%.1fC RHlocal=%.1f%% status=OK\n",
+    Serial.printf("[DHT] LOCAL T=%.1fC RH=%.1f%% status=OK\n",
                   sensors.localTemperatureC,
                   sensors.localRelativeHumidity);
     return;
@@ -1017,20 +1028,20 @@ void formatHumanUptime(char* buffer, size_t size) {
   uint64_t seconds = static_cast<uint64_t>(esp_timer_get_time() / 1000000ULL);
   uint64_t minutes = seconds / 60ULL;
   if (minutes < 60ULL) {
-    snprintf(buffer, size, "Up: %llumin", minutes);
+    snprintf(buffer, size, "UP: %lluMIN", minutes);
     return;
   }
 
   uint64_t hours = minutes / 60ULL;
   uint64_t remainingMinutes = minutes % 60ULL;
   if (hours < 24ULL) {
-    snprintf(buffer, size, "Up: %02lluh%02llum", hours, remainingMinutes);
+    snprintf(buffer, size, "UP: %02lluH%02lluM", hours, remainingMinutes);
     return;
   }
 
   uint64_t days = hours / 24ULL;
   uint64_t remainingHours = hours % 24ULL;
-  snprintf(buffer, size, "Up: %02llud%02lluh", days, remainingHours);
+  snprintf(buffer, size, "UP: %02lluD%02lluH", days, remainingHours);
 }
 
 bool readJsonFloat(JsonVariantConst value, float* out) {
@@ -1041,8 +1052,32 @@ bool readJsonFloat(JsonVariantConst value, float* out) {
   return true;
 }
 
+bool readJsonLong(JsonVariantConst value, long* out) {
+  if (value.isNull() || !value.is<long>()) return false;
+  *out = value.as<long>();
+  return true;
+}
+
+float approximateDistanceKm(float lat1, float lon1, float lat2, float lon2) {
+  if (!isfinite(lat1) || !isfinite(lon1) || !isfinite(lat2) || !isfinite(lon2)) return NAN;
+  constexpr float earthRadiusKm = 6371.0f;
+  float dLat = radians(lat2 - lat1);
+  float dLon = radians(lon2 - lon1);
+  float rLat1 = radians(lat1);
+  float rLat2 = radians(lat2);
+  float a = sin(dLat / 2.0f) * sin(dLat / 2.0f) +
+            cos(rLat1) * cos(rLat2) * sin(dLon / 2.0f) * sin(dLon / 2.0f);
+  float c = 2.0f * atan2(sqrt(a), sqrt(1.0f - a));
+  return earthRadiusKm * c;
+}
+
 bool parseOpenMeteo(const String& payload) {
   JsonDocument filter;
+  filter["latitude"] = true;
+  filter["longitude"] = true;
+  filter["elevation"] = true;
+  filter["timezone"] = true;
+  filter["utc_offset_seconds"] = true;
   filter["current"]["temperature_2m"] = true;
   filter["current"]["relative_humidity_2m"] = true;
   filter["hourly"]["precipitation_probability"] = true;
@@ -1097,6 +1132,22 @@ bool parseOpenMeteo(const String& payload) {
   weather.totalRainMmNext6h = totalMm;
   weather.remoteTemperature2m = temperature;
   weather.remoteRelativeHumidity2m = humidity;
+
+  float gridLatitude = NAN;
+  float gridLongitude = NAN;
+  float gridElevation = NAN;
+  long utcOffsetSeconds = 0;
+  if (readJsonFloat(doc["latitude"], &gridLatitude)) weatherGrid.latitude = gridLatitude;
+  if (readJsonFloat(doc["longitude"], &gridLongitude)) weatherGrid.longitude = gridLongitude;
+  if (readJsonFloat(doc["elevation"], &gridElevation)) weatherGrid.elevation = gridElevation;
+  if (readJsonLong(doc["utc_offset_seconds"], &utcOffsetSeconds)) {
+    weatherGrid.utcOffsetSeconds = utcOffsetSeconds;
+  }
+  const char* responseTimezone = doc["timezone"] | "";
+  if (responseTimezone[0] != '\0') {
+    snprintf(weatherGrid.timezone, sizeof(weatherGrid.timezone), "%s", responseTimezone);
+  }
+
   return true;
 }
 
@@ -1114,7 +1165,7 @@ void handleWeather(unsigned long now) {
 
   char url[448];
   snprintf(url, sizeof(url),
-           "https://api.open-meteo.com/v1/forecast?latitude=%.12f&longitude=%.12f&elevation=%.0f&current=temperature_2m,relative_humidity_2m&hourly=precipitation_probability,precipitation&forecast_hours=6&timezone=%s",
+           "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&elevation=%.0f&current=temperature_2m,relative_humidity_2m&hourly=precipitation_probability,precipitation&forecast_hours=6&timezone=%s",
            WEATHER_LATITUDE,
            WEATHER_LONGITUDE,
            WEATHER_ELEVATION_M,
@@ -1139,11 +1190,27 @@ void handleWeather(unsigned long now) {
 
   if (ok) {
     weatherStatus = WeatherStatus::OK;
-    Serial.printf("[WEATHER] Rain6h=%d%% %.1fmm Tremote=%.1f RHremote=%.1f\n",
-                  weather.maxRainProbabilityNext6h,
-                  weather.totalRainMmNext6h,
+    float gridOffsetKm = approximateDistanceKm(static_cast<float>(atof(WEATHER_LATITUDE)),
+                                               static_cast<float>(atof(WEATHER_LONGITUDE)),
+                                               weatherGrid.latitude,
+                                               weatherGrid.longitude);
+    Serial.printf("[WEATHER] requested lat=%s lon=%s elev=%.0f\n",
+                  WEATHER_LATITUDE,
+                  WEATHER_LONGITUDE,
+                  WEATHER_ELEVATION_M);
+    Serial.printf("[WEATHER] grid lat=%.6f lon=%.6f elev=%.0f timezone=%s utc_offset=%ld offset=%.2fkm\n",
+                  weatherGrid.latitude,
+                  weatherGrid.longitude,
+                  weatherGrid.elevation,
+                  weatherGrid.timezone[0] != '\0' ? weatherGrid.timezone : "UNKNOWN",
+                  weatherGrid.utcOffsetSeconds,
+                  gridOffsetKm);
+    Serial.printf("[WEATHER] REMOTE T=%.1fC RH=%.1f%%\n",
                   weather.remoteTemperature2m,
                   weather.remoteRelativeHumidity2m);
+    Serial.printf("[WEATHER] Rain6h=%d%% %.1fmm\n",
+                  weather.maxRainProbabilityNext6h,
+                  weather.totalRainMmNext6h);
   } else {
     weatherStatus = WeatherStatus::API_FAILURE;
     Serial.printf("[WEATHER] ERROR code=%d\n", httpCode);
@@ -1328,11 +1395,11 @@ void handleManualValveTest(unsigned long now) {
 
 void formatSystemLine(char* line, size_t size) {
   if (systemState == SystemState::SENSOR_FAULT) {
-    snprintf(line, size, "Horta: SENSOR");
+    snprintf(line, size, "HORTA: SENSOR");
   } else if (soilSensorStatus == Status::UNCALIBRATED) {
-    snprintf(line, size, "Horta: ATENCAO");
+    snprintf(line, size, "HORTA: ATENCAO");
   } else {
-    snprintf(line, size, "Horta: NORMAL");
+    snprintf(line, size, "HORTA: NORMAL");
   }
 }
 
@@ -1348,68 +1415,65 @@ void displayPublicPage(PublicDisplayPage page, char* line1, size_t line1Size, ch
   switch (page) {
     case PublicDisplayPage::SYSTEM:
       formatSystemLine(line1, line1Size);
-      snprintf(line2, line2Size, "Valvula: %s", valveOpen ? "ON" : "OFF");
+      snprintf(line2, line2Size, "VALVULA: %s", valveOpen ? "ON" : "OFF");
       break;
 
     case PublicDisplayPage::SOIL:
       if (soilSensorStatus == Status::UNCALIBRATED) {
-        snprintf(line1, line1Size, "Solo: CALIBRAR");
+        snprintf(line1, line1Size, "SOLO: CALIBRAR");
         snprintf(line2, line2Size, "RAW:%4d", sensors.soilRawFiltered);
       } else {
-        snprintf(line1, line1Size, "Umidade do solo");
+        snprintf(line1, line1Size, "UMIDADE SOLO");
         if (sensors.soilPercent == INVALID_SOIL_PERCENT) {
-          snprintf(line2, line2Size, "Indisponivel");
+          snprintf(line2, line2Size, "INDISPONIVEL");
         } else {
           snprintf(line2, line2Size, "%3d%%", sensors.soilPercent);
         }
       }
       break;
 
-    case PublicDisplayPage::TEMPERATURE:
-      snprintf(line1, line1Size, "LOCAL");
+    case PublicDisplayPage::LOCAL_ENVIRONMENT:
+      snprintf(line1, line1Size, "AMBIENTE LOCAL");
       if (dhtStatus == Status::OK &&
           isfinite(sensors.localTemperatureC) &&
           isfinite(sensors.localRelativeHumidity)) {
-        snprintf(line2, line2Size, "T:%.1fC U:%.0f%%",
+        char candidate[24];
+        snprintf(candidate, sizeof(candidate), "T:%.1fC U:%.0f%%",
                  sensors.localTemperatureC,
                  sensors.localRelativeHumidity);
+        if (strlen(candidate) <= 16) {
+          snprintf(line2, line2Size, "%s", candidate);
+        } else {
+          snprintf(line2, line2Size, "T:%.0fC U:%.0f%%",
+                   sensors.localTemperatureC,
+                   sensors.localRelativeHumidity);
+        }
       } else {
-        snprintf(line2, line2Size, "Indisponivel");
-      }
-      break;
-
-    case PublicDisplayPage::AIR_HUMIDITY:
-      snprintf(line1, line1Size, "Umidade do ar");
-      if (dhtStatus == Status::OK && isfinite(sensors.localRelativeHumidity)) {
-        snprintf(line2, line2Size, "%.0f%%", sensors.localRelativeHumidity);
-      } else {
-        snprintf(line2, line2Size, "Indisponivel");
+        snprintf(line2, line2Size, "INDISPONIVEL");
       }
       break;
 
     case PublicDisplayPage::WEATHER:
       if (weatherStatus == WeatherStatus::OK) {
-        snprintf(line1, line1Size, "METEO");
-        snprintf(line2, line2Size, "T:%.1fC U:%.0f%%",
-                 weather.remoteTemperature2m,
-                 weather.remoteRelativeHumidity2m);
-      } else if (weatherStatus == WeatherStatus::WIFI_OFFLINE) {
-        snprintf(line1, line1Size, "METEO");
-        snprintf(line2, line2Size, "Sem internet");
+        snprintf(line1, line1Size, "PREVISAO 6H");
+        char candidate[24];
+        snprintf(candidate, sizeof(candidate), "CHUVA:%d%% %.1fMM",
+                 weather.maxRainProbabilityNext6h,
+                 weather.totalRainMmNext6h);
+        if (strlen(candidate) <= 16) {
+          snprintf(line2, line2Size, "%s", candidate);
+        } else {
+          snprintf(line2, line2Size, "CHUVA: %d%%", weather.maxRainProbabilityNext6h);
+        }
       } else {
-        snprintf(line1, line1Size, "METEO");
-        snprintf(line2, line2Size, "Indisponivel");
+        snprintf(line1, line1Size, "PREVISAO 6H");
+        snprintf(line2, line2Size, "INDISPONIVEL");
       }
       break;
 
-    case PublicDisplayPage::UPTIME:
-      snprintf(line1, line1Size, "Sistema ativo");
-      formatHumanUptime(line2, line2Size);
-      break;
-
     default:
-      snprintf(line1, line1Size, "Display");
-      snprintf(line2, line2Size, "Pagina invalida");
+      snprintf(line1, line1Size, "DISPLAY");
+      snprintf(line2, line2Size, "PAGINA INVALIDA");
       break;
   }
 }
@@ -1418,7 +1482,7 @@ void displayDeveloperPage(DeveloperDisplayPage page, char* line1, size_t line1Si
   switch (page) {
     case DeveloperDisplayPage::SYSTEM:
       snprintf(line1, line1Size, "%s %s", stateName(systemState), valveOpen ? "V:ON" : "V:OFF");
-      snprintf(line2, line2Size, "Auto:%s %s", ENABLE_AUTOMATIC_IRRIGATION ? "ON" : "OFF", decisionReason(lastDecision));
+      snprintf(line2, line2Size, "AUTO:%s %s", ENABLE_AUTOMATIC_IRRIGATION ? "ON" : "OFF", decisionReason(lastDecision));
       break;
 
     case DeveloperDisplayPage::SOIL_RAW:
@@ -1427,44 +1491,60 @@ void displayDeveloperPage(DeveloperDisplayPage page, char* line1, size_t line1Si
       break;
 
     case DeveloperDisplayPage::WIFI:
-      snprintf(line1, line1Size, "WiFi: %s", wifiStatus == Status::OK ? "ONLINE" : "OFFLINE");
+      snprintf(line1, line1Size, "WIFI: %s", wifiStatus == Status::OK ? "ONLINE" : "OFFLINE");
       if (wifiStatus == Status::OK) {
-        snprintf(line2, line2Size, "RSSI:%4d dBm", WiFi.RSSI());
+        snprintf(line2, line2Size, "RSSI:%4d DBM", WiFi.RSSI());
       } else {
-        char ssid[17];
-        formatShortSsid(ssid, sizeof(ssid));
-        snprintf(line2, line2Size, "SSID: %s", ssid);
+        snprintf(line2, line2Size, "RECONECTANDO");
       }
       break;
+
+    case DeveloperDisplayPage::WIFI_SSID: {
+      char ssid[17];
+      formatShortSsid(ssid, sizeof(ssid));
+      snprintf(line1, line1Size, "SSID");
+      snprintf(line2, line2Size, "%s", ssid);
+      break;
+    }
 
     case DeveloperDisplayPage::DHT:
       snprintf(line1, line1Size, "DHT: %s", statusName(dhtStatus));
       if (isfinite(sensors.localTemperatureC) && isfinite(sensors.localRelativeHumidity)) {
         snprintf(line2, line2Size, "T%.1f RH%.0f%%", sensors.localTemperatureC, sensors.localRelativeHumidity);
       } else {
-        snprintf(line2, line2Size, "Sem leitura");
+        snprintf(line2, line2Size, "SEM LEITURA");
       }
       break;
 
     case DeveloperDisplayPage::WEATHER:
       if (weatherStatus == WeatherStatus::OK) {
-        snprintf(line1, line1Size, "Rem T%.1f RH%.0f", weather.remoteTemperature2m, weather.remoteRelativeHumidity2m);
-        snprintf(line2, line2Size, "Rain%3d%% %.1fmm", weather.maxRainProbabilityNext6h, weather.totalRainMmNext6h);
+        snprintf(line1, line1Size, "REM T%.1f RH%.0f", weather.remoteTemperature2m, weather.remoteRelativeHumidity2m);
+        snprintf(line2, line2Size, "RAIN%3d%% %.1fMM", weather.maxRainProbabilityNext6h, weather.totalRainMmNext6h);
       } else if (weatherStatus == WeatherStatus::WIFI_OFFLINE) {
-        snprintf(line1, line1Size, "Clima: SEM WIFI");
-        snprintf(line2, line2Size, "Controle LOCAL");
+        snprintf(line1, line1Size, "CLIMA: SEM WIFI");
+        snprintf(line2, line2Size, "CONTROLE LOCAL");
       } else if (weatherStatus == WeatherStatus::API_FAILURE) {
-        snprintf(line1, line1Size, "Clima: FALHA");
-        snprintf(line2, line2Size, "API Open-Meteo");
+        snprintf(line1, line1Size, "CLIMA: FALHA");
+        snprintf(line2, line2Size, "API OPEN-METEO");
       } else {
-        snprintf(line1, line1Size, "Clima: AGUARDE");
-        snprintf(line2, line2Size, "Nao verificado");
+        snprintf(line1, line1Size, "CLIMA: AGUARDE");
+        snprintf(line2, line2Size, "NAO VERIFICADO");
+      }
+      break;
+
+    case DeveloperDisplayPage::WEATHER_GRID:
+      if (isfinite(weatherGrid.latitude) && isfinite(weatherGrid.longitude)) {
+        snprintf(line1, line1Size, "GRID %.4f", weatherGrid.latitude);
+        snprintf(line2, line2Size, "LON %.4f", weatherGrid.longitude);
+      } else {
+        snprintf(line1, line1Size, "GRID");
+        snprintf(line2, line2Size, "INDISPONIVEL");
       }
       break;
 
     case DeveloperDisplayPage::CLOUD:
-      snprintf(line1, line1Size, "Cloud: %s", statusName(cloudStatus));
-      snprintf(line2, line2Size, "Script:PENDENTE");
+      snprintf(line1, line1Size, "CLOUD: %s", statusName(cloudStatus));
+      snprintf(line2, line2Size, "SCRIPT:PENDENTE");
       break;
 
     case DeveloperDisplayPage::DEVICE:
@@ -1472,9 +1552,14 @@ void displayDeveloperPage(DeveloperDisplayPage page, char* line1, size_t line1Si
       formatHumanUptime(line2, line2Size);
       break;
 
+    case DeveloperDisplayPage::RESET_UPTIME:
+      snprintf(line1, line1Size, "RESET %s", resetReasonText);
+      formatHumanUptime(line2, line2Size);
+      break;
+
     default:
-      snprintf(line1, line1Size, "Display");
-      snprintf(line2, line2Size, "Pagina invalida");
+      snprintf(line1, line1Size, "DISPLAY");
+      snprintf(line2, line2Size, "PAGINA INVALIDA");
       break;
   }
 }
@@ -1483,7 +1568,7 @@ void displayCalibrationPage(char* line1, size_t line1Size, char* line2, size_t l
   switch (calibrationUiState) {
     case CalibrationUiState::DRY_READY:
       snprintf(line1, line1Size, "SECO PRONTO?");
-      snprintf(line2, line2Size, "Toque BOOT");
+      snprintf(line2, line2Size, "TOQUE BOOT");
       break;
 
     case CalibrationUiState::DRY_MEASURING:
@@ -1496,7 +1581,7 @@ void displayCalibrationPage(char* line1, size_t line1Size, char* line2, size_t l
 
     case CalibrationUiState::WET_READY:
       snprintf(line1, line1Size, "SOLO UMIDO");
-      snprintf(line2, line2Size, "Toque BOOT");
+      snprintf(line2, line2Size, "TOQUE BOOT");
       break;
 
     case CalibrationUiState::WET_MEASURING:
@@ -1509,12 +1594,12 @@ void displayCalibrationPage(char* line1, size_t line1Size, char* line2, size_t l
 
     case CalibrationUiState::REVIEW:
       snprintf(line1, line1Size, "D%04d W%04d", candidateDry, candidateWet);
-      snprintf(line2, line2Size, "Segure p/salvar");
+      snprintf(line2, line2Size, "SEGURE P/SALVAR");
       break;
 
     case CalibrationUiState::SAVING:
       snprintf(line1, line1Size, "SALVANDO CAL");
-      snprintf(line2, line2Size, "Aguarde");
+      snprintf(line2, line2Size, "AGUARDE");
       break;
 
     case CalibrationUiState::COMPLETE:
@@ -1524,12 +1609,12 @@ void displayCalibrationPage(char* line1, size_t line1Size, char* line2, size_t l
 
     case CalibrationUiState::INVALID:
       snprintf(line1, line1Size, "%s", calibrationSaveFailed ? "SALVAR FALHOU" : "CAL INVALIDA");
-      snprintf(line2, line2Size, "Anterior mantida");
+      snprintf(line2, line2Size, "ANTERIOR MANTIDA");
       break;
 
     case CalibrationUiState::CANCELLED:
       snprintf(line1, line1Size, "CAL CANCELADA");
-      snprintf(line2, line2Size, "Sem alteracao");
+      snprintf(line2, line2Size, "SEM ALTERACAO");
       break;
 
     default:
@@ -1574,14 +1659,14 @@ void handleDisplay(unsigned long now) {
     long secondsLeft = static_cast<long>((MANUAL_VALVE_TEST_MS - (now - manualValveTestStateStartedMs)) / 1000UL);
     if (secondsLeft < 0) secondsLeft = 0;
     char line2[17];
-    snprintf(line2, sizeof(line2), "Fecha:%lds", secondsLeft);
+    snprintf(line2, sizeof(line2), "FECHA:%ldS", secondsLeft);
     printLcdLine(0, "TESTE VALVULA");
     printLcdLine(1, line2);
     return;
   }
 
   if (systemState == SystemState::BOOT) {
-    printLcdLine(0, "Horta ESP32");
+    printLcdLine(0, "HORTA ESP32");
     printLcdLine(1, "BELA VISTA");
     return;
   }
@@ -1605,21 +1690,21 @@ void handleDisplay(unsigned long now) {
   if (now < displayModeNoticeUntilMs) {
     if (displayMode == DisplayMode::DEVELOPER) {
       snprintf(line1, sizeof(line1), "MODO TECNICO");
-      snprintf(line2, sizeof(line2), "Ativado");
+      snprintf(line2, sizeof(line2), "ATIVADO");
     } else {
       snprintf(line1, sizeof(line1), "MODO PUBLICO");
-      snprintf(line2, sizeof(line2), "Ativado");
+      snprintf(line2, sizeof(line2), "ATIVADO");
     }
   } else if (systemState == SystemState::PRE_IRRIGATION) {
     long secondsLeft = static_cast<long>((PRE_IRRIGATION_MS - (now - stateStartedMs)) / 1000UL);
     if (secondsLeft < 0) secondsLeft = 0;
     snprintf(line1, sizeof(line1), "IRRIGACAO EM:");
-    snprintf(line2, sizeof(line2), "%ld segundos", secondsLeft);
+    snprintf(line2, sizeof(line2), "%ld SEGUNDOS", secondsLeft);
   } else if (systemState == SystemState::IRRIGATING) {
     long secondsLeft = static_cast<long>((VALVE_PULSE_MS - (now - valveOpenedAtMs)) / 1000UL);
     if (secondsLeft < 0) secondsLeft = 0;
     snprintf(line1, sizeof(line1), "IRRIGANDO %u/%u", currentPulse, MAX_PULSES_PER_CYCLE);
-    snprintf(line2, sizeof(line2), "Pulso: %lds", secondsLeft);
+    snprintf(line2, sizeof(line2), "PULSO: %ldS", secondsLeft);
   } else {
     if (displayMode == DisplayMode::PUBLIC) {
       displayPublicPage(currentPublicDisplayPage, line1, sizeof(line1), line2, sizeof(line2));
@@ -1887,10 +1972,11 @@ void setup() {
                 ESP_ARDUINO_VERSION_MINOR,
                 ESP_ARDUINO_VERSION_PATCH);
   Serial.println("[BOOT] BOOT button GPIO0 active-low; holding it during reset may enter download mode.");
-  Serial.printf("[WEATHER] lat=%.6f lon=%.6f elev=%.0fm\n",
+  Serial.printf("[WEATHER] requested lat=%s lon=%s elev=%.0fm timezone=%s\n",
                 WEATHER_LATITUDE,
                 WEATHER_LONGITUDE,
-                WEATHER_ELEVATION_M);
+                WEATHER_ELEVATION_M,
+                WEATHER_TIMEZONE);
   Serial.println("[VALVE] CLOSED");
   loadSoilCalibration();
 
@@ -1909,7 +1995,7 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   lcd.init();
   lcd.backlight();
-  printLcdLine(0, "Horta ESP32");
+  printLcdLine(0, "HORTA ESP32");
   printLcdLine(1, "BELA VISTA");
 
   analogReadResolution(12);
