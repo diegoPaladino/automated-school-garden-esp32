@@ -13,6 +13,7 @@
 #include "config.h"
 
 #include <ArduinoJson.h>
+#include <DHT.h>
 #include <HTTPClient.h>
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
@@ -66,10 +67,26 @@ enum class Decision : uint8_t {
   COMPLETE
 };
 
-enum class DisplayPage : uint8_t {
+enum class DisplayMode : uint8_t {
+  PUBLIC,
+  DEVELOPER
+};
+
+enum class PublicDisplayPage : uint8_t {
   SYSTEM,
   SOIL,
+  TEMPERATURE,
+  AIR_HUMIDITY,
+  WEATHER,
+  UPTIME,
+  COUNT
+};
+
+enum class DeveloperDisplayPage : uint8_t {
+  SYSTEM,
+  SOIL_RAW,
   WIFI,
+  DHT,
   WEATHER,
   CLOUD,
   DEVICE,
@@ -89,6 +106,12 @@ enum class CalibrationUiState : uint8_t {
   CANCELLED
 };
 
+enum class ManualValveTestState : uint8_t {
+  INACTIVE,
+  ARMED,
+  ACTIVE
+};
+
 struct WifiProfile {
   const char* ssid;
   const char* password;
@@ -99,6 +122,8 @@ struct SensorData {
   int soilRawFiltered = 0;
   int soilRawSlow = 0;
   int soilPercent = INVALID_SOIL_PERCENT;
+  float localTemperatureC = NAN;
+  float localRelativeHumidity = NAN;
 };
 
 struct WeatherData {
@@ -111,17 +136,23 @@ struct WeatherData {
 struct FutureLogRecord {
   char timestamp[24];
   unsigned long uptime;
+  float localTemperature;
+  float localAirHumidity;
+  Status dhtStatus;
   float remoteTemperature;
   float remoteAirHumidity;
   int soilRaw;
   int soilRawFiltered;
+  int soilRawSlow;
   int soilPercent;
   Status soilSensorStatus;
+  uint32_t dhtFailureCount;
   int rainProbability6h;
   float rainMm6h;
   WeatherStatus weatherStatus;
   Status wifiStatus;
   int wifiRSSI;
+  const char* connectedSsid;
   SystemState systemState;
   bool valveOpen;
   uint8_t irrigationPulse;
@@ -141,6 +172,7 @@ struct CalibrationMeasurement {
 };
 
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+DHT dht(DHT_PIN, DHT_TYPE);
 
 constexpr char SOIL_CAL_NAMESPACE[] = "soilcal";
 constexpr char SOIL_CAL_KEY_DRY[] = "dry";
@@ -149,7 +181,6 @@ constexpr char SOIL_CAL_KEY_VALID[] = "valid";
 constexpr char SOIL_CAL_KEY_VERSION[] = "version";
 constexpr uint8_t SOIL_CAL_SUPPORTED_VERSION = 1;
 constexpr uint8_t SOIL_CAL_MEASUREMENT_COUNT = 31;
-constexpr unsigned long BUTTON_LONG_PRESS_MS = 5000UL;
 constexpr unsigned long SOIL_CAL_SAMPLE_INTERVAL_MS = 250UL;
 constexpr unsigned long SOIL_CAL_RESULT_HOLD_MS = 5000UL;
 
@@ -166,8 +197,12 @@ Status wifiStatus = Status::UNKNOWN;
 WeatherStatus weatherStatus = WeatherStatus::NOT_CHECKED;
 Status cloudStatus = ENABLE_CLOUD_LOGGING ? Status::UNKNOWN : Status::INACTIVE;
 Status soilSensorStatus = Status::UNCALIBRATED;
+Status dhtStatus = Status::UNKNOWN;
 Decision lastDecision = Decision::NONE;
-DisplayPage currentDisplayPage = DisplayPage::SYSTEM;
+DisplayMode displayMode = DisplayMode::PUBLIC;
+PublicDisplayPage currentPublicDisplayPage = PublicDisplayPage::SYSTEM;
+DeveloperDisplayPage currentDeveloperDisplayPage = DeveloperDisplayPage::SYSTEM;
+ManualValveTestState manualValveTestState = ManualValveTestState::INACTIVE;
 
 bool soilCalibrationLoaded = false;
 bool soilCalibrationValid = false;
@@ -181,9 +216,13 @@ char connectedSsid[33] = "";
 
 unsigned long bootStartedMs = 0;
 unsigned long lastSoilReadMs = 0;
+unsigned long lastDhtReadMs = 0;
+unsigned long lastDhtSuccessMs = 0;
 unsigned long lastDisplayRefreshMs = 0;
 unsigned long lastDisplayRotationMs = 0;
 unsigned long manualDisplayUntilMs = 0;
+unsigned long displayModeNoticeUntilMs = 0;
+unsigned long lastDeveloperInteractionMs = 0;
 unsigned long lastWeatherAttemptMs = 0;
 unsigned long lastCloudLogMs = 0;
 unsigned long lastSerialStatusMs = 0;
@@ -208,8 +247,12 @@ bool wifiAttemptInProgress = false;
 bool buttonStableLevel = HIGH;
 bool buttonLastReading = HIGH;
 bool buttonPressedArmed = false;
-bool buttonLongHandled = false;
 unsigned long buttonPressedAtMs = 0;
+uint8_t buttonShortPressCount = 0;
+unsigned long firstButtonShortPressMs = 0;
+unsigned long lastButtonShortPressMs = 0;
+unsigned long manualValveTestStateStartedMs = 0;
+uint32_t dhtFailureCount = 0;
 
 bool buzzerToneStarted = false;
 
@@ -253,14 +296,35 @@ const char* stateName(SystemState state) {
   }
 }
 
-const char* displayPageName(DisplayPage page) {
+const char* displayModeName(DisplayMode mode) {
+  switch (mode) {
+    case DisplayMode::PUBLIC: return "PUBLIC";
+    case DisplayMode::DEVELOPER: return "DEVELOPER";
+    default: return "UNKNOWN";
+  }
+}
+
+const char* publicDisplayPageName(PublicDisplayPage page) {
   switch (page) {
-    case DisplayPage::SYSTEM: return "SYSTEM";
-    case DisplayPage::SOIL: return "SOIL";
-    case DisplayPage::WIFI: return "WIFI";
-    case DisplayPage::WEATHER: return "WEATHER";
-    case DisplayPage::CLOUD: return "CLOUD";
-    case DisplayPage::DEVICE: return "DEVICE";
+    case PublicDisplayPage::SYSTEM: return "SYSTEM";
+    case PublicDisplayPage::SOIL: return "SOIL";
+    case PublicDisplayPage::TEMPERATURE: return "TEMPERATURE";
+    case PublicDisplayPage::AIR_HUMIDITY: return "AIR_HUMIDITY";
+    case PublicDisplayPage::WEATHER: return "WEATHER";
+    case PublicDisplayPage::UPTIME: return "UPTIME";
+    default: return "UNKNOWN";
+  }
+}
+
+const char* developerDisplayPageName(DeveloperDisplayPage page) {
+  switch (page) {
+    case DeveloperDisplayPage::SYSTEM: return "SYSTEM";
+    case DeveloperDisplayPage::SOIL_RAW: return "SOIL_RAW";
+    case DeveloperDisplayPage::WIFI: return "WIFI";
+    case DeveloperDisplayPage::DHT: return "DHT";
+    case DeveloperDisplayPage::WEATHER: return "WEATHER";
+    case DeveloperDisplayPage::CLOUD: return "CLOUD";
+    case DeveloperDisplayPage::DEVICE: return "DEVICE";
     default: return "UNKNOWN";
   }
 }
@@ -301,6 +365,8 @@ uint8_t configuredWifiProfileCount() {
   }
   return count;
 }
+
+void clearLineCache();
 
 bool selectNextConfiguredWifiProfile() {
   constexpr uint8_t profileCount = sizeof(wifiProfiles) / sizeof(wifiProfiles[0]);
@@ -350,6 +416,50 @@ void openValve() {
   valveOpenedAtMs = millis();
   stopBuzzer();
   Serial.println("[VALVE] OPEN");
+}
+
+void openValveForManualTest(unsigned long now) {
+  digitalWrite(RELAY_PIN, VALVE_OPEN_LEVEL);
+  valveOpen = true;
+  valveOpenedAtMs = now;
+  stopBuzzer();
+  Serial.println("[VALVE_TEST] OPEN");
+}
+
+void finishManualValveTest(const char* reason) {
+  closeValve(reason);
+  manualValveTestState = ManualValveTestState::INACTIVE;
+  manualValveTestStateStartedMs = 0;
+  manualDisplayUntilMs = millis() + MANUAL_DISPLAY_HOLD_MS;
+  clearLineCache();
+  Serial.printf("[VALVE_TEST] CLOSED reason=%s\n", reason);
+}
+
+void armManualValveTest(unsigned long now) {
+  closeValve("VALVE_TEST_ARM");
+  manualValveTestState = ManualValveTestState::ARMED;
+  manualValveTestStateStartedMs = now;
+  manualDisplayUntilMs = now + MANUAL_VALVE_CONFIRM_TIMEOUT_MS;
+  clearLineCache();
+  Serial.println("[VALVE_TEST] ARMED");
+}
+
+void confirmManualValveTest(unsigned long now) {
+  manualValveTestState = ManualValveTestState::ACTIVE;
+  manualValveTestStateStartedMs = now;
+  manualDisplayUntilMs = now + MANUAL_VALVE_TEST_MS;
+  clearLineCache();
+  Serial.println("[VALVE_TEST] CONFIRMED");
+  openValveForManualTest(now);
+}
+
+void cancelManualValveTest(const char* reason) {
+  closeValve(reason);
+  manualValveTestState = ManualValveTestState::INACTIVE;
+  manualValveTestStateStartedMs = 0;
+  manualDisplayUntilMs = millis() + MANUAL_DISPLAY_HOLD_MS;
+  clearLineCache();
+  Serial.println("[VALVE_TEST] CANCELLED");
 }
 
 void setState(SystemState nextState) {
@@ -557,8 +667,47 @@ void handleSoil(unsigned long now) {
                 soilCalibrationValid ? "YES" : "NO");
 }
 
+bool dhtValueValid(float temperature, float humidity) {
+  if (!isfinite(temperature) || !isfinite(humidity)) return false;
+  if (humidity < 0.0f || humidity > 100.0f) return false;
+  return temperature > -20.0f && temperature < 80.0f;
+}
+
+void handleDht(unsigned long now) {
+  if (now - lastDhtReadMs < DHT_READ_INTERVAL_MS) {
+    if (lastDhtSuccessMs != 0 && dhtStatus == Status::OK &&
+        now - lastDhtSuccessMs >= DHT_STALE_MS) {
+      dhtStatus = Status::OFFLINE;
+    }
+    return;
+  }
+  lastDhtReadMs = now;
+
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  if (dhtValueValid(temperature, humidity)) {
+    sensors.localTemperatureC = temperature + DHT_TEMPERATURE_OFFSET_C;
+    sensors.localRelativeHumidity = constrain(humidity + DHT_HUMIDITY_OFFSET_PERCENT, 0.0f, 100.0f);
+    lastDhtSuccessMs = now;
+    dhtStatus = Status::OK;
+    Serial.printf("[DHT] Tlocal=%.1fC RHlocal=%.1f%% status=OK\n",
+                  sensors.localTemperatureC,
+                  sensors.localRelativeHumidity);
+    return;
+  }
+
+  if (lastDhtSuccessMs != 0 && now - lastDhtSuccessMs >= DHT_STALE_MS) {
+    dhtStatus = Status::OFFLINE;
+  } else {
+    dhtStatus = Status::FAULT;
+  }
+  dhtFailureCount++;
+  Serial.printf("[DHT] status=%s\n", statusName(dhtStatus));
+}
+
 void handleSensors(unsigned long now) {
   handleSoil(now);
+  handleDht(now);
 }
 
 bool calibrationModeActive() {
@@ -965,9 +1114,10 @@ void handleWeather(unsigned long now) {
 
   char url[448];
   snprintf(url, sizeof(url),
-           "https://api.open-meteo.com/v1/forecast?latitude=%.12f&longitude=%.12f&current=temperature_2m,relative_humidity_2m&hourly=precipitation_probability,precipitation&forecast_hours=6&timezone=%s",
+           "https://api.open-meteo.com/v1/forecast?latitude=%.12f&longitude=%.12f&elevation=%.0f&current=temperature_2m,relative_humidity_2m&hourly=precipitation_probability,precipitation&forecast_hours=6&timezone=%s",
            WEATHER_LATITUDE,
            WEATHER_LONGITUDE,
+           WEATHER_ELEVATION_M,
            WEATHER_TIMEZONE);
 
   HTTPClient http;
@@ -1156,6 +1306,26 @@ void handleIrrigation(unsigned long now) {
   }
 }
 
+void handleManualValveTest(unsigned long now) {
+  switch (manualValveTestState) {
+    case ManualValveTestState::ARMED:
+      if (now - manualValveTestStateStartedMs >= MANUAL_VALVE_CONFIRM_TIMEOUT_MS) {
+        finishManualValveTest("CONFIRM_TIMEOUT");
+      }
+      break;
+
+    case ManualValveTestState::ACTIVE:
+      if (now - manualValveTestStateStartedMs >= MANUAL_VALVE_TEST_MS) {
+        finishManualValveTest("TIMEOUT");
+      }
+      break;
+
+    case ManualValveTestState::INACTIVE:
+    default:
+      break;
+  }
+}
+
 void formatSystemLine(char* line, size_t size) {
   if (systemState == SystemState::SENSOR_FAULT) {
     snprintf(line, size, "Horta: SENSOR");
@@ -1174,29 +1344,89 @@ void formatShortSsid(char* buffer, size_t size) {
   snprintf(buffer, size, "%.15s", connectedSsid);
 }
 
-void displayPage(DisplayPage page, char* line1, size_t line1Size, char* line2, size_t line2Size) {
+void displayPublicPage(PublicDisplayPage page, char* line1, size_t line1Size, char* line2, size_t line2Size) {
   switch (page) {
-    case DisplayPage::SYSTEM:
+    case PublicDisplayPage::SYSTEM:
       formatSystemLine(line1, line1Size);
       snprintf(line2, line2Size, "Valvula: %s", valveOpen ? "ON" : "OFF");
       break;
 
-    case DisplayPage::SOIL:
+    case PublicDisplayPage::SOIL:
       if (soilSensorStatus == Status::UNCALIBRATED) {
         snprintf(line1, line1Size, "Solo: CALIBRAR");
-      } else if (soilSensorStatus == Status::FAULT) {
-        snprintf(line1, line1Size, "Solo: FALHA");
-      } else {
-        snprintf(line1, line1Size, "Umidade solo");
-      }
-      if (sensors.soilPercent == INVALID_SOIL_PERCENT) {
         snprintf(line2, line2Size, "RAW:%4d", sensors.soilRawFiltered);
       } else {
-        snprintf(line2, line2Size, "%3d%%", sensors.soilPercent);
+        snprintf(line1, line1Size, "Umidade do solo");
+        if (sensors.soilPercent == INVALID_SOIL_PERCENT) {
+          snprintf(line2, line2Size, "Indisponivel");
+        } else {
+          snprintf(line2, line2Size, "%3d%%", sensors.soilPercent);
+        }
       }
       break;
 
-    case DisplayPage::WIFI:
+    case PublicDisplayPage::TEMPERATURE:
+      snprintf(line1, line1Size, "LOCAL");
+      if (dhtStatus == Status::OK &&
+          isfinite(sensors.localTemperatureC) &&
+          isfinite(sensors.localRelativeHumidity)) {
+        snprintf(line2, line2Size, "T:%.1fC U:%.0f%%",
+                 sensors.localTemperatureC,
+                 sensors.localRelativeHumidity);
+      } else {
+        snprintf(line2, line2Size, "Indisponivel");
+      }
+      break;
+
+    case PublicDisplayPage::AIR_HUMIDITY:
+      snprintf(line1, line1Size, "Umidade do ar");
+      if (dhtStatus == Status::OK && isfinite(sensors.localRelativeHumidity)) {
+        snprintf(line2, line2Size, "%.0f%%", sensors.localRelativeHumidity);
+      } else {
+        snprintf(line2, line2Size, "Indisponivel");
+      }
+      break;
+
+    case PublicDisplayPage::WEATHER:
+      if (weatherStatus == WeatherStatus::OK) {
+        snprintf(line1, line1Size, "METEO");
+        snprintf(line2, line2Size, "T:%.1fC U:%.0f%%",
+                 weather.remoteTemperature2m,
+                 weather.remoteRelativeHumidity2m);
+      } else if (weatherStatus == WeatherStatus::WIFI_OFFLINE) {
+        snprintf(line1, line1Size, "METEO");
+        snprintf(line2, line2Size, "Sem internet");
+      } else {
+        snprintf(line1, line1Size, "METEO");
+        snprintf(line2, line2Size, "Indisponivel");
+      }
+      break;
+
+    case PublicDisplayPage::UPTIME:
+      snprintf(line1, line1Size, "Sistema ativo");
+      formatHumanUptime(line2, line2Size);
+      break;
+
+    default:
+      snprintf(line1, line1Size, "Display");
+      snprintf(line2, line2Size, "Pagina invalida");
+      break;
+  }
+}
+
+void displayDeveloperPage(DeveloperDisplayPage page, char* line1, size_t line1Size, char* line2, size_t line2Size) {
+  switch (page) {
+    case DeveloperDisplayPage::SYSTEM:
+      snprintf(line1, line1Size, "%s %s", stateName(systemState), valveOpen ? "V:ON" : "V:OFF");
+      snprintf(line2, line2Size, "Auto:%s %s", ENABLE_AUTOMATIC_IRRIGATION ? "ON" : "OFF", decisionReason(lastDecision));
+      break;
+
+    case DeveloperDisplayPage::SOIL_RAW:
+      snprintf(line1, line1Size, "RAW:%4d F:%4d", sensors.soilRawInstant, sensors.soilRawFiltered);
+      snprintf(line2, line2Size, "S:%4d P:%3d%%", sensors.soilRawSlow, sensors.soilPercent);
+      break;
+
+    case DeveloperDisplayPage::WIFI:
       snprintf(line1, line1Size, "WiFi: %s", wifiStatus == Status::OK ? "ONLINE" : "OFFLINE");
       if (wifiStatus == Status::OK) {
         snprintf(line2, line2Size, "RSSI:%4d dBm", WiFi.RSSI());
@@ -1207,10 +1437,19 @@ void displayPage(DisplayPage page, char* line1, size_t line1Size, char* line2, s
       }
       break;
 
-    case DisplayPage::WEATHER:
+    case DeveloperDisplayPage::DHT:
+      snprintf(line1, line1Size, "DHT: %s", statusName(dhtStatus));
+      if (isfinite(sensors.localTemperatureC) && isfinite(sensors.localRelativeHumidity)) {
+        snprintf(line2, line2Size, "T%.1f RH%.0f%%", sensors.localTemperatureC, sensors.localRelativeHumidity);
+      } else {
+        snprintf(line2, line2Size, "Sem leitura");
+      }
+      break;
+
+    case DeveloperDisplayPage::WEATHER:
       if (weatherStatus == WeatherStatus::OK) {
-        snprintf(line1, line1Size, "Clima: ONLINE");
-        snprintf(line2, line2Size, "Chuva6h:%3d%%", weather.maxRainProbabilityNext6h);
+        snprintf(line1, line1Size, "Rem T%.1f RH%.0f", weather.remoteTemperature2m, weather.remoteRelativeHumidity2m);
+        snprintf(line2, line2Size, "Rain%3d%% %.1fmm", weather.maxRainProbabilityNext6h, weather.totalRainMmNext6h);
       } else if (weatherStatus == WeatherStatus::WIFI_OFFLINE) {
         snprintf(line1, line1Size, "Clima: SEM WIFI");
         snprintf(line2, line2Size, "Controle LOCAL");
@@ -1223,14 +1462,14 @@ void displayPage(DisplayPage page, char* line1, size_t line1Size, char* line2, s
       }
       break;
 
-    case DisplayPage::CLOUD:
-      snprintf(line1, line1Size, "Cloud: INATIVO");
-      snprintf(line2, line2Size, "Script: PENDENTE");
+    case DeveloperDisplayPage::CLOUD:
+      snprintf(line1, line1Size, "Cloud: %s", statusName(cloudStatus));
+      snprintf(line2, line2Size, "Script:PENDENTE");
       break;
 
-    case DisplayPage::DEVICE:
-      formatHumanUptime(line2, line2Size);
+    case DeveloperDisplayPage::DEVICE:
       snprintf(line1, line1Size, "FW %s", FIRMWARE_VERSION);
+      formatHumanUptime(line2, line2Size);
       break;
 
     default:
@@ -1313,6 +1552,34 @@ void handleDisplay(unsigned long now) {
     return;
   }
 
+  if (displayMode == DisplayMode::DEVELOPER &&
+      now - lastDeveloperInteractionMs >= DEVELOPER_MODE_TIMEOUT_MS) {
+    displayMode = DisplayMode::PUBLIC;
+    currentPublicDisplayPage = PublicDisplayPage::SYSTEM;
+    manualDisplayUntilMs = 0;
+    lastDisplayRotationMs = now;
+    displayModeNoticeUntilMs = now + DISPLAY_MODE_NOTICE_MS;
+    clearLineCache();
+    Serial.println("[DISPLAY] developer timeout -> PUBLIC");
+    Serial.println("[DISPLAY] mode=PUBLIC");
+  }
+
+  if (manualValveTestState == ManualValveTestState::ARMED) {
+    printLcdLine(0, "TESTE VALVULA?");
+    printLcdLine(1, "CLIQUE CONFIRMA");
+    return;
+  }
+
+  if (manualValveTestState == ManualValveTestState::ACTIVE) {
+    long secondsLeft = static_cast<long>((MANUAL_VALVE_TEST_MS - (now - manualValveTestStateStartedMs)) / 1000UL);
+    if (secondsLeft < 0) secondsLeft = 0;
+    char line2[17];
+    snprintf(line2, sizeof(line2), "Fecha:%lds", secondsLeft);
+    printLcdLine(0, "TESTE VALVULA");
+    printLcdLine(1, line2);
+    return;
+  }
+
   if (systemState == SystemState::BOOT) {
     printLcdLine(0, "Horta ESP32");
     printLcdLine(1, "BELA VISTA");
@@ -1321,15 +1588,29 @@ void handleDisplay(unsigned long now) {
 
   if (now >= manualDisplayUntilMs && now - lastDisplayRotationMs >= DISPLAY_ROTATION_MS) {
     lastDisplayRotationMs = now;
-    uint8_t page = static_cast<uint8_t>(currentDisplayPage);
-    page = (page + 1) % static_cast<uint8_t>(DisplayPage::COUNT);
-    currentDisplayPage = static_cast<DisplayPage>(page);
+    if (displayMode == DisplayMode::PUBLIC) {
+      uint8_t page = static_cast<uint8_t>(currentPublicDisplayPage);
+      page = (page + 1) % static_cast<uint8_t>(PublicDisplayPage::COUNT);
+      currentPublicDisplayPage = static_cast<PublicDisplayPage>(page);
+    } else {
+      uint8_t page = static_cast<uint8_t>(currentDeveloperDisplayPage);
+      page = (page + 1) % static_cast<uint8_t>(DeveloperDisplayPage::COUNT);
+      currentDeveloperDisplayPage = static_cast<DeveloperDisplayPage>(page);
+    }
   }
 
   char line1[17];
   char line2[17];
 
-  if (systemState == SystemState::PRE_IRRIGATION) {
+  if (now < displayModeNoticeUntilMs) {
+    if (displayMode == DisplayMode::DEVELOPER) {
+      snprintf(line1, sizeof(line1), "MODO TECNICO");
+      snprintf(line2, sizeof(line2), "Ativado");
+    } else {
+      snprintf(line1, sizeof(line1), "MODO PUBLICO");
+      snprintf(line2, sizeof(line2), "Ativado");
+    }
+  } else if (systemState == SystemState::PRE_IRRIGATION) {
     long secondsLeft = static_cast<long>((PRE_IRRIGATION_MS - (now - stateStartedMs)) / 1000UL);
     if (secondsLeft < 0) secondsLeft = 0;
     snprintf(line1, sizeof(line1), "IRRIGACAO EM:");
@@ -1340,7 +1621,11 @@ void handleDisplay(unsigned long now) {
     snprintf(line1, sizeof(line1), "IRRIGANDO %u/%u", currentPulse, MAX_PULSES_PER_CYCLE);
     snprintf(line2, sizeof(line2), "Pulso: %lds", secondsLeft);
   } else {
-    displayPage(currentDisplayPage, line1, sizeof(line1), line2, sizeof(line2));
+    if (displayMode == DisplayMode::PUBLIC) {
+      displayPublicPage(currentPublicDisplayPage, line1, sizeof(line1), line2, sizeof(line2));
+    } else {
+      displayDeveloperPage(currentDeveloperDisplayPage, line1, sizeof(line1), line2, sizeof(line2));
+    }
   }
 
   printLcdLine(0, line1);
@@ -1348,30 +1633,130 @@ void handleDisplay(unsigned long now) {
 }
 
 void cycleDisplayPage(unsigned long now) {
-  uint8_t page = static_cast<uint8_t>(currentDisplayPage);
-  page = (page + 1) % static_cast<uint8_t>(DisplayPage::COUNT);
-  currentDisplayPage = static_cast<DisplayPage>(page);
+  if (displayMode == DisplayMode::PUBLIC) {
+    uint8_t page = static_cast<uint8_t>(currentPublicDisplayPage);
+    page = (page + 1) % static_cast<uint8_t>(PublicDisplayPage::COUNT);
+    currentPublicDisplayPage = static_cast<PublicDisplayPage>(page);
+  } else {
+    uint8_t page = static_cast<uint8_t>(currentDeveloperDisplayPage);
+    page = (page + 1) % static_cast<uint8_t>(DeveloperDisplayPage::COUNT);
+    currentDeveloperDisplayPage = static_cast<DeveloperDisplayPage>(page);
+    lastDeveloperInteractionMs = now;
+  }
   manualDisplayUntilMs = now + MANUAL_DISPLAY_HOLD_MS;
   lastDisplayRotationMs = now;
   clearLineCache();
   Serial.println("[BUTTON] BOOT short press");
-  Serial.printf("[DISPLAY] page=%s\n", displayPageName(currentDisplayPage));
+  if (displayMode == DisplayMode::PUBLIC) {
+    Serial.printf("[DISPLAY] mode=PUBLIC page=%s\n", publicDisplayPageName(currentPublicDisplayPage));
+  } else {
+    Serial.printf("[DISPLAY] mode=DEVELOPER page=%s\n", developerDisplayPageName(currentDeveloperDisplayPage));
+  }
+}
+
+void resetButtonShortPressSequence() {
+  buttonShortPressCount = 0;
+  firstButtonShortPressMs = 0;
+  lastButtonShortPressMs = 0;
+}
+
+void toggleDisplayMode(unsigned long now) {
+  if (displayMode == DisplayMode::PUBLIC) {
+    displayMode = DisplayMode::DEVELOPER;
+    currentDeveloperDisplayPage = DeveloperDisplayPage::SYSTEM;
+    lastDeveloperInteractionMs = now;
+  } else {
+    displayMode = DisplayMode::PUBLIC;
+    currentPublicDisplayPage = PublicDisplayPage::SYSTEM;
+  }
+  manualDisplayUntilMs = now + MANUAL_DISPLAY_HOLD_MS;
+  lastDisplayRotationMs = now;
+  displayModeNoticeUntilMs = now + DISPLAY_MODE_NOTICE_MS;
+  clearLineCache();
+  Serial.printf("[DISPLAY] mode=%s\n", displayModeName(displayMode));
+}
+
+bool registerButtonShortPressForModeToggle(unsigned long now) {
+  if (calibrationModeActive()) return false;
+
+  if (buttonShortPressCount == 0 ||
+      now - lastButtonShortPressMs > BUTTON_TRIPLE_CLICK_MAX_GAP_MS ||
+      now - firstButtonShortPressMs > BUTTON_TRIPLE_CLICK_WINDOW_MS) {
+    buttonShortPressCount = 1;
+    firstButtonShortPressMs = now;
+  } else {
+    buttonShortPressCount++;
+  }
+  lastButtonShortPressMs = now;
+
+  if (buttonShortPressCount >= 3) {
+    resetButtonShortPressSequence();
+    toggleDisplayMode(now);
+    return true;
+  }
+  return false;
 }
 
 void handleButtonShortPress(unsigned long now) {
   if (calibrationModeActive()) {
+    resetButtonShortPressSequence();
     handleCalibrationShortPress(now);
+  } else if (registerButtonShortPressForModeToggle(now)) {
+    Serial.println("[BUTTON] BOOT triple short press");
   } else {
     cycleDisplayPage(now);
   }
 }
 
 void handleButtonLongPress(unsigned long now) {
+  resetButtonShortPressSequence();
   if (calibrationModeActive()) {
     handleCalibrationLongPress(now);
   } else {
     enterSoilCalibrationMode(now);
   }
+}
+
+void handleButtonVeryLongPress(unsigned long now) {
+  resetButtonShortPressSequence();
+  if (calibrationModeActive()) {
+    handleCalibrationLongPress(now);
+    return;
+  }
+  Serial.println("[BUTTON] VERY_LONG -> VALVE_TEST_ARMED");
+  armManualValveTest(now);
+}
+
+void handleButtonRelease(unsigned long now, unsigned long durationMs) {
+  if (manualValveTestState == ManualValveTestState::ARMED) {
+    if (durationMs < BOOT_SHORT_PRESS_MAX_MS) {
+      Serial.println("[BUTTON] SHORT");
+      confirmManualValveTest(now);
+    } else {
+      cancelManualValveTest("CONFIRM_NOT_SHORT");
+    }
+    return;
+  }
+
+  if (durationMs < BOOT_SHORT_PRESS_MAX_MS) {
+    Serial.println("[BUTTON] SHORT");
+    handleButtonShortPress(now);
+    return;
+  }
+
+  if (durationMs >= BOOT_VALVE_ARM_PRESS_MS) {
+    handleButtonVeryLongPress(now);
+    return;
+  }
+
+  if (durationMs >= BOOT_LONG_PRESS_MIN_MS) {
+    Serial.println("[BUTTON] LONG -> SOIL_CALIBRATION");
+    handleButtonLongPress(now);
+    return;
+  }
+
+  resetButtonShortPressSequence();
+  Serial.println("[BUTTON] IGNORED duration=MEDIUM");
 }
 
 void handleButton(unsigned long now) {
@@ -1386,46 +1771,46 @@ void handleButton(unsigned long now) {
   if (reading != buttonStableLevel) {
     buttonStableLevel = reading;
     if (buttonStableLevel == BOOT_BUTTON_ACTIVE_LEVEL) {
+      if (manualValveTestState == ManualValveTestState::ACTIVE) {
+        Serial.println("[VALVE_TEST] CANCELLED_BY_BUTTON");
+        cancelManualValveTest("CANCELLED_BY_BUTTON");
+        buttonPressedArmed = false;
+        return;
+      }
       buttonPressedArmed = true;
-      buttonLongHandled = false;
       buttonPressedAtMs = now;
       return;
     }
 
     if (buttonPressedArmed) {
-      bool wasLongHandled = buttonLongHandled;
+      unsigned long durationMs = now - buttonPressedAtMs;
       buttonPressedArmed = false;
-      buttonLongHandled = false;
-      if (!wasLongHandled) {
-        handleButtonShortPress(now);
-      }
+      handleButtonRelease(now, durationMs);
     }
     return;
-  }
-
-  if (buttonStableLevel == BOOT_BUTTON_ACTIVE_LEVEL &&
-      buttonPressedArmed &&
-      !buttonLongHandled &&
-      now - buttonPressedAtMs >= BUTTON_LONG_PRESS_MS) {
-    buttonLongHandled = true;
-    handleButtonLongPress(now);
   }
 }
 
 void buildFutureLogRecord(FutureLogRecord* record) {
   timestampNow(record->timestamp, sizeof(record->timestamp));
   record->uptime = millis();
+  record->localTemperature = sensors.localTemperatureC;
+  record->localAirHumidity = sensors.localRelativeHumidity;
+  record->dhtStatus = dhtStatus;
   record->remoteTemperature = weather.remoteTemperature2m;
   record->remoteAirHumidity = weather.remoteRelativeHumidity2m;
   record->soilRaw = sensors.soilRawInstant;
   record->soilRawFiltered = sensors.soilRawFiltered;
+  record->soilRawSlow = sensors.soilRawSlow;
   record->soilPercent = sensors.soilPercent;
   record->soilSensorStatus = soilSensorStatus;
+  record->dhtFailureCount = dhtFailureCount;
   record->rainProbability6h = weather.maxRainProbabilityNext6h;
   record->rainMm6h = weather.totalRainMmNext6h;
   record->weatherStatus = weatherStatus;
   record->wifiStatus = wifiStatus;
   record->wifiRSSI = wifiStatus == Status::OK ? WiFi.RSSI() : 0;
+  record->connectedSsid = connectedSsid;
   record->systemState = systemState;
   record->valveOpen = valveOpen;
   record->irrigationPulse = currentPulse;
@@ -1475,12 +1860,13 @@ void handleSerialStatus(unsigned long now) {
   if (now - lastSerialStatusMs < SERIAL_STATUS_INTERVAL_MS) return;
   lastSerialStatusMs = now;
 
-  Serial.printf("[STATUS] state=%s wifi=%s weather=%s cloud=%s soil=%s valve=%s decision=%s auto=%s cloudEnabled=%s\n",
+  Serial.printf("[STATUS] state=%s wifi=%s weather=%s cloud=%s soil=%s dht=%s valve=%s decision=%s auto=%s cloudEnabled=%s\n",
                 stateName(systemState),
                 statusName(wifiStatus),
                 weatherStatusName(weatherStatus),
                 statusName(cloudStatus),
                 statusName(soilSensorStatus),
+                statusName(dhtStatus),
                 valveOpen ? "OPEN" : "CLOSED",
                 decisionReason(lastDecision),
                 ENABLE_AUTOMATIC_IRRIGATION ? "ON" : "OFF",
@@ -1501,6 +1887,10 @@ void setup() {
                 ESP_ARDUINO_VERSION_MINOR,
                 ESP_ARDUINO_VERSION_PATCH);
   Serial.println("[BOOT] BOOT button GPIO0 active-low; holding it during reset may enter download mode.");
+  Serial.printf("[WEATHER] lat=%.6f lon=%.6f elev=%.0fm\n",
+                WEATHER_LATITUDE,
+                WEATHER_LONGITUDE,
+                WEATHER_ELEVATION_M);
   Serial.println("[VALVE] CLOSED");
   loadSoilCalibration();
 
@@ -1513,6 +1903,8 @@ void setup() {
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   buttonStableLevel = digitalRead(BOOT_BUTTON_PIN);
   buttonLastReading = buttonStableLevel;
+
+  dht.begin();
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   lcd.init();
@@ -1530,8 +1922,10 @@ void setup() {
   bootStartedMs = millis();
   stateStartedMs = bootStartedMs;
   lastSoilReadMs = bootStartedMs - SOIL_INTERVAL_MS;
+  lastDhtReadMs = bootStartedMs - DHT_READ_INTERVAL_MS;
   lastDisplayRefreshMs = bootStartedMs - DISPLAY_REFRESH_MS;
   lastDisplayRotationMs = bootStartedMs;
+  lastDeveloperInteractionMs = bootStartedMs;
   lastWifiAttemptMs = bootStartedMs - WIFI_RECONNECT_MIN_MS;
 
   Serial.printf("[BOOT] WiFi profiles=%u\n", configuredWifiProfileCount());
@@ -1548,6 +1942,7 @@ void loop() {
   handleWeather(now);
   handleIrrigation(now);
   handleButton(now);
+  handleManualValveTest(now);
   handleCalibrationMode(now);
   handleDisplay(now);
   handleCloudLogging(now);

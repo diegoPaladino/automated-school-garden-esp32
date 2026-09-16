@@ -11,11 +11,12 @@ The system is designed to keep running without Wi-Fi or Internet access. Cloud t
 - ESP32-WROOM-32 / ESP32 Dev Module firmware using Arduino Framework and PlatformIO.
 - Cooperative `millis()` scheduling with no blocking Wi-Fi boot loop.
 - Soil-moisture raw ADC reading with median-trimmed filtering and slow smoothing.
+- Local DHT11 environmental readings for temperature and air humidity.
 - Runtime soil calibration stored in ESP32 NVS, with BOOT/LCD maintenance workflow.
 - Irrigation finite state machine with fail-safe relay behavior.
 - Open-Meteo weather integration for current temperature/humidity and next-6-hours rain forecast.
-- 16x2 I2C LCD diagnostic pages with low-flicker line caching.
-- Native ESP32 BOOT button on GPIO0 for LCD page navigation.
+- 16x2 I2C LCD with PUBLIC and DEVELOPER page rotations and low-flicker line caching.
+- Native ESP32 BOOT button on GPIO0 for LCD navigation, display-mode toggle, and soil calibration.
 - Human-readable uptime on the LCD device page.
 - Watchdog, heartbeat LED, serial diagnostics, and reset-reason reporting.
 - Secret management through an ignored local `include/secrets.h`.
@@ -25,6 +26,7 @@ The system is designed to keep running without Wi-Fi or Internet access. Cloud t
 | Function | ESP32 Pin | Notes |
 | --- | ---: | --- |
 | Soil moisture analog input | GPIO36 | ADC input, raw values remain visible before calibration |
+| DHT11 data | GPIO15 | Local temperature and local air humidity; GPIO15 is strapping-capable, avoid holding it low during boot |
 | Relay / valve control | GPIO23 | `HIGH` closes valve, `LOW` opens valve |
 | Buzzer | GPIO13 | Pre-irrigation warning |
 | I2C LCD SDA | GPIO21 | LCD address `0x3F` |
@@ -37,7 +39,10 @@ Holding BOOT while resetting or powering the ESP32 can enter flashing/download m
 Runtime BOOT button behavior:
 
 - Short press: next LCD page.
+- Three quick short presses: toggle PUBLIC / DEVELOPER LCD mode.
 - Long press, approximately 5 seconds: enter soil calibration mode.
+
+DEVELOPER mode is runtime-only and is not persisted to NVS. Every reset starts in PUBLIC mode. If no BOOT interaction occurs for about 2 minutes while in DEVELOPER mode, the LCD automatically returns to PUBLIC mode.
 
 ## Firmware Architecture
 
@@ -55,6 +60,19 @@ The main loop is organized around small cooperative handlers:
 - `handleSerialStatus()`
 
 Irrigation states include boot, idle, pre-irrigation warning, irrigating, soak wait, cooldown, and sensor fault. Uncertain conditions fail safe with the valve closed.
+
+The DHT11 is sampled cooperatively about once every 60 seconds. Invalid DHT values are never converted to zero, never reset the ESP32, and never block irrigation. If the sensor fails, the last valid values remain internal telemetry but the public LCD shows `Indisponivel` until fresh data is available.
+
+LCD PUBLIC mode is intended for students, teachers, families, and visitors:
+
+- `Horta: NORMAL` / valve state.
+- `Umidade do solo` as a calibrated percentage, or calibration guidance.
+- `Temperatura` from the local DHT11.
+- `Umidade do ar` from the local DHT11.
+- `Previsao 6h` with rain probability from Open-Meteo.
+- `Sistema ativo` using the human-readable uptime formatter.
+
+LCD DEVELOPER mode exposes maintenance diagnostics such as Wi-Fi/RSSI, raw soil ADC values, DHT status and local values, Open-Meteo remote values, cloud placeholder status, firmware version, uptime, system state, decision state, and automatic-irrigation state.
 
 ## Safety / Fail-Safe Design
 
@@ -111,6 +129,11 @@ The candidate stays in RAM until the review/save step. Cancelling or producing a
 
 ## Weather Integration
 
+Local environmental readings and remote weather data are intentionally separate:
+
+- DHT11 on GPIO15: local temperature and local air humidity near the garden.
+- Open-Meteo: remote/external current weather and next-6-hours forecast.
+
 Open-Meteo remains supported using:
 
 - Latitude: `-16.736933184033457`
@@ -165,7 +188,7 @@ Current validated pinout:
 | --- | ---: | --- |
 | On-board LED | GPIO2 | Manual blink test |
 | Soil moisture analog input | GPIO36 | Raw ADC only, uncalibrated |
-| DHT11 signal | GPIO15 | Under hardware investigation; GPIO15 is a strapping pin |
+| DHT11 signal | GPIO15 | Physically validated local temperature/air humidity sensor; GPIO15 is a strapping pin |
 | Buzzer | GPIO13 | Physically validated audible test pin |
 | Relay input IN2 | GPIO23 | `HIGH` off, `LOW` active |
 | LCD SDA | GPIO21 | I2C address `0x3F` |
@@ -210,6 +233,5 @@ Warning: `r` physically actuates the relay for approximately 500 ms. The passive
 ## Roadmap
 
 - Measure real soil dry/wet calibration values.
-- Reintroduce an environmental sensor after hardware diagnosis.
 - Configure Google Apps Script and enable cloud logging safely.
 - Add structured telemetry payloads and long-term data storage.

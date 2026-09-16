@@ -5,8 +5,6 @@
 
 #include "config.h"
 
-constexpr int DHT_PIN = 15;
-constexpr uint8_t DHT_TYPE = DHT11;
 constexpr unsigned long SOIL_STREAM_INTERVAL_MS = 500UL;
 constexpr unsigned long RELAY_PULSE_MS = 500UL;
 constexpr unsigned long BUZZER_TEST_MS = 700UL;
