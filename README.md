@@ -4,7 +4,7 @@
 
 Automated School Garden is an ESP32 firmware project for a school irrigation controller. The current revision is focused on safe local operation, observable diagnostics, and a clean PlatformIO workflow suitable for a public embedded/IoT portfolio.
 
-The system is designed to keep running without Wi-Fi or Internet access. Cloud telemetry and automatic irrigation are intentionally disabled in this revision while hardware calibration and external services are still pending.
+The system is designed to keep running without Wi-Fi or Internet access. Real cloud telemetry is enabled through the deployed Google Apps Script backend, while automatic irrigation remains intentionally disabled by configuration.
 
 ## Features
 
@@ -19,6 +19,7 @@ The system is designed to keep running without Wi-Fi or Internet access. Cloud t
 - Native ESP32 BOOT button on GPIO0 for LCD navigation, display-mode toggle, soil calibration, and arming the manual valve test.
 - Human-readable uptime on DEVELOPER LCD pages.
 - Watchdog, heartbeat LED, serial diagnostics, and reset-reason reporting.
+- HTTPS telemetry to Google Apps Script, which writes Google Sheets rows and drives backend email/report monitoring.
 - Secret management through an ignored local `include/secrets.h`.
 
 ## Hardware
@@ -72,7 +73,21 @@ LCD PUBLIC mode is intended for students, teachers, families, and visitors:
 - `AMBIENTE LOCAL` with local DHT11 temperature and relative humidity on one page.
 - `PREVISAO 6H` with Open-Meteo rain probability and, when it fits, total forecast precipitation.
 
-LCD DEVELOPER mode exposes maintenance diagnostics such as Wi-Fi/RSSI, connected SSID, raw/filtered soil ADC values, DHT status and local values, Open-Meteo remote values, Open-Meteo grid coordinates, rain probability/mm, cloud placeholder status, firmware version, reset reason, uptime, system state, decision state, valve state, and automatic-irrigation state.
+LCD DEVELOPER mode exposes maintenance diagnostics such as Wi-Fi/RSSI, connected SSID, raw/filtered soil ADC values, DHT status and local values, Open-Meteo remote values, Open-Meteo grid coordinates, rain probability/mm, cloud status/retry cadence, firmware version, reset reason, uptime, system state, decision state, valve state, and automatic-irrigation state.
+
+## Cloud Telemetry
+
+The production telemetry path is:
+
+```text
+ESP32 -> HTTPS POST -> Google Apps Script Web App -> Google Sheets / email / reports
+```
+
+The ESP32 sends authenticated JSON telemetry to the configured Google Apps Script `/exec` URL. The device token is sent only in the JSON body, never in the URL, query string, LCD, or serial logs. The firmware treats a transmission as successful only when the HTTP request completes and the returned JSON contains `ok: true`.
+
+Normal telemetry runs every 5 minutes. A successful telemetry POST is also the heartbeat; there is no separate heartbeat HTTP request. The external Google Apps Script watchdog can therefore mark the device offline if no successful telemetry row is received for approximately 15 minutes.
+
+If Wi-Fi, DNS, TLS, Google Apps Script, JSON parsing, or token validation fails, the local controller continues to run and a bounded retry is scheduled. Cloud telemetry is skipped while the valve is open or the irrigation state machine is in a time-sensitive valve-actuation phase.
 
 ## Safety / Fail-Safe Design
 
@@ -87,12 +102,10 @@ Implemented:
 Disabled by design:
 
 - `ENABLE_AUTOMATIC_IRRIGATION = false`
-- `ENABLE_CLOUD_LOGGING = false`
 
 Pending:
 
 - Final physical validation of stored dry/wet soil calibration values.
-- Google Apps Script endpoint and cloud telemetry upload.
 
 ## Soil Sensor Calibration
 
@@ -168,7 +181,7 @@ Create a local secrets file before building:
 
 In practice, copy `include/secrets.example.h` to `include/secrets.h` and replace placeholders locally. `include/secrets.h` is ignored by Git and must not be committed.
 
-Never place Wi-Fi passwords, private API keys, Google Apps Script URLs, or service tokens in tracked source files.
+The tracked `include/secrets.example.h` contains only placeholders, including `YOUR_GOOGLE_APPS_SCRIPT_URL` and `YOUR_DEVICE_TOKEN`. Never place Wi-Fi passwords, Google Apps Script URLs, service tokens, or other private credentials in tracked source files.
 
 ## Building with PlatformIO
 
@@ -247,5 +260,5 @@ Warning: `r` physically actuates the relay for approximately 500 ms. The passive
 ## Roadmap
 
 - Measure real soil dry/wet calibration values.
-- Configure Google Apps Script and enable cloud logging safely.
-- Add structured telemetry payloads and long-term data storage.
+- Confirm the first real ESP32 telemetry row in Google Sheets before enabling backend monitoring.
+- Consider persistent offline telemetry buffering in a future scoped change.

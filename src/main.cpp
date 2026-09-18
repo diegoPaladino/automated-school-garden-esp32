@@ -18,6 +18,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <esp_arduino_version.h>
 #include <esp_timer.h>
@@ -144,7 +145,7 @@ struct WeatherResponseLocation {
 
 struct FutureLogRecord {
   char timestamp[24];
-  unsigned long uptime;
+  uint64_t uptimeSeconds;
   float localTemperature;
   float localAirHumidity;
   Status dhtStatus;
@@ -166,7 +167,6 @@ struct FutureLogRecord {
   bool valveOpen;
   uint8_t irrigationPulse;
   Decision decision;
-  const char* decisionReason;
   const char* firmwareVersion;
   const char* resetReason;
 };
@@ -192,6 +192,40 @@ constexpr uint8_t SOIL_CAL_SUPPORTED_VERSION = 1;
 constexpr uint8_t SOIL_CAL_MEASUREMENT_COUNT = 31;
 constexpr unsigned long SOIL_CAL_SAMPLE_INTERVAL_MS = 250UL;
 constexpr unsigned long SOIL_CAL_RESULT_HOLD_MS = 5000UL;
+
+constexpr char GOOGLE_GTS_ROOT_R1_CA[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaMf/vo
+27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vXmX7w
+Cl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7zUjw
+TcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0Pfybl
+qAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtcvfaH
+szVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4Zor8
+Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUspzBmk
+MiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOORc92
+wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYWk70p
+aDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+DVrN
+VjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgFlQID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBAJ+qQibb
+C5u+/x6Wki4+omVKapi6Ist9wTrYggoGxval3sBOh2Z5ofmmWJyq+bXmYOfg6LEe
+QkEzCzc9zolwFcq1JKjPa7XSQCGYzyI0zzvFIoTgxQ6KfF2I5DUkzps+GlQebtuy
+h6f88/qBVRRiClmpIgUxPoLW7ttXNLwzldMXG+gnoot7TiYaelpkttGsN/H9oPM4
+7HLwEXWdyzRSjeZ2axfG34arJ45JK3VmgRAhpuo+9K4l/3wV3s6MJT/KYnAK9y8J
+ZgfIPxz88NtFMN9iiMG1D53Dn0reWVlHxYciNuaCp+0KueIHoI17eko8cdLiA6Ef
+MgfdG+RCzgwARWGAtQsgWSl4vflVy2PFPEz0tv/bal8xa5meLMFrUKTX5hgUvYU/
+Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
+6u9AWpQKXCBfTkBdYiJ23//OYb2MI3jSNwLgjt7RETeJ9r/tSQdirpLsQBqvFAnZ
+0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm
+2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
+bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
+-----END CERTIFICATE-----
+)EOF";
 
 WifiProfile wifiProfiles[] = {
   {WIFI_SSID_1, WIFI_PASSWORD_1},
@@ -235,6 +269,7 @@ unsigned long displayModeNoticeUntilMs = 0;
 unsigned long lastDeveloperInteractionMs = 0;
 unsigned long lastWeatherAttemptMs = 0;
 unsigned long lastCloudLogMs = 0;
+unsigned long nextCloudLogMs = 0;
 unsigned long lastSerialStatusMs = 0;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastWifiAttemptMs = 0;
@@ -357,8 +392,41 @@ const char* decisionReason(Decision decision) {
   }
 }
 
+const char* decisionName(Decision decision) {
+  switch (decision) {
+    case Decision::WAITING: return "WAITING";
+    case Decision::BLOCKED_DISABLED: return "BLOCKED_DISABLED";
+    case Decision::BLOCKED_SOIL_UNCALIBRATED: return "BLOCKED_SOIL_UNCALIBRATED";
+    case Decision::BLOCKED_SOIL_INVALID: return "BLOCKED_SOIL_INVALID";
+    case Decision::BLOCKED_TIME: return "BLOCKED_TIME";
+    case Decision::BLOCKED_WEATHER: return "BLOCKED_WEATHER";
+    case Decision::BLOCKED_COOLDOWN: return "BLOCKED_COOLDOWN";
+    case Decision::START_PRE_IRRIGATION: return "START_PRE_IRRIGATION";
+    case Decision::IRRIGATING: return "IRRIGATING";
+    case Decision::SOAKING: return "SOAKING";
+    case Decision::COMPLETE: return "COMPLETE";
+    default: return "NONE";
+  }
+}
+
 bool isConfiguredText(const char* value, const char* placeholder) {
   return value != nullptr && value[0] != '\0' && strcmp(value, placeholder) != 0;
+}
+
+bool isCloudEndpointConfigured() {
+  return isConfiguredText(GOOGLE_SCRIPT_URL, "YOUR_GOOGLE_APPS_SCRIPT_URL");
+}
+
+bool isCloudEndpointHttps() {
+  return strncmp(GOOGLE_SCRIPT_URL, "https://", 8) == 0;
+}
+
+bool isCloudTokenConfigured() {
+  return isConfiguredText(DEVICE_TOKEN, "YOUR_DEVICE_TOKEN");
+}
+
+bool isCloudConfigured() {
+  return isCloudEndpointConfigured() && isCloudEndpointHttps() && isCloudTokenConfigured();
 }
 
 bool isWifiProfileConfigured(const WifiProfile& profile) {
@@ -1544,7 +1612,13 @@ void displayDeveloperPage(DeveloperDisplayPage page, char* line1, size_t line1Si
 
     case DeveloperDisplayPage::CLOUD:
       snprintf(line1, line1Size, "CLOUD: %s", statusName(cloudStatus));
-      snprintf(line2, line2Size, "SCRIPT:PENDENTE");
+      if (!ENABLE_CLOUD_LOGGING || !isCloudConfigured()) {
+        snprintf(line2, line2Size, "INATIVO");
+      } else if (cloudStatus == Status::FAULT) {
+        snprintf(line2, line2Size, "RETRY: 60S");
+      } else {
+        snprintf(line2, line2Size, "ENVIO: 5MIN");
+      }
       break;
 
     case DeveloperDisplayPage::DEVICE:
@@ -1878,7 +1952,7 @@ void handleButton(unsigned long now) {
 
 void buildFutureLogRecord(FutureLogRecord* record) {
   timestampNow(record->timestamp, sizeof(record->timestamp));
-  record->uptime = millis();
+  record->uptimeSeconds = static_cast<uint64_t>(esp_timer_get_time() / 1000000ULL);
   record->localTemperature = sensors.localTemperatureC;
   record->localAirHumidity = sensors.localRelativeHumidity;
   record->dhtStatus = dhtStatus;
@@ -1900,9 +1974,146 @@ void buildFutureLogRecord(FutureLogRecord* record) {
   record->valveOpen = valveOpen;
   record->irrigationPulse = currentPulse;
   record->decision = lastDecision;
-  record->decisionReason = decisionReason(lastDecision);
   record->firmwareVersion = FIRMWARE_VERSION;
   record->resetReason = resetReasonText;
+}
+
+void setJsonIntOrNull(JsonDocument& doc, const char* key, bool valid, int value) {
+  if (valid) {
+    doc[key] = value;
+  } else {
+    doc[key] = nullptr;
+  }
+}
+
+void setJsonFloatOrNull(JsonDocument& doc, const char* key, bool valid, float value) {
+  if (valid && isfinite(value)) {
+    doc[key] = value;
+  } else {
+    doc[key] = nullptr;
+  }
+}
+
+void setJsonSoilPercentOrNull(JsonDocument& doc, const char* key, int value) {
+  if (value == INVALID_SOIL_PERCENT) {
+    doc[key] = nullptr;
+  } else {
+    doc[key] = value;
+  }
+}
+
+bool buildCloudPayload(const FutureLogRecord& record, String* payloadOut) {
+  JsonDocument doc;
+  doc["device_token"] = DEVICE_TOKEN;
+  doc["device_id"] = DEVICE_ID;
+  doc["firmware_version"] = record.firmwareVersion;
+  doc["uptime_s"] = record.uptimeSeconds;
+
+  doc["soil_raw"] = record.soilRaw;
+  doc["soil_filtered"] = record.soilRawFiltered;
+  doc["soil_slow"] = record.soilRawSlow;
+  setJsonSoilPercentOrNull(doc, "soil_percent", record.soilPercent);
+  doc["soil_status"] = statusName(record.soilSensorStatus);
+
+  const bool dhtValuesValid = record.dhtStatus == Status::OK;
+  setJsonFloatOrNull(doc, "local_temperature_c", dhtValuesValid, record.localTemperature);
+  setJsonFloatOrNull(doc, "local_humidity_pct", dhtValuesValid, record.localAirHumidity);
+  doc["dht_status"] = statusName(record.dhtStatus);
+  doc["dht_failure_count"] = record.dhtFailureCount;
+
+  const bool weatherValuesValid = record.weatherStatus == WeatherStatus::OK;
+  setJsonIntOrNull(doc, "rain_probability_6h_pct", weatherValuesValid, record.rainProbability6h);
+  setJsonFloatOrNull(doc, "rain_6h_mm", weatherValuesValid, record.rainMm6h);
+  setJsonFloatOrNull(doc, "remote_temperature_c", weatherValuesValid, record.remoteTemperature);
+  setJsonFloatOrNull(doc, "remote_humidity_pct", weatherValuesValid, record.remoteAirHumidity);
+  doc["weather_status"] = weatherStatusName(record.weatherStatus);
+
+  doc["wifi_status"] = statusName(record.wifiStatus);
+  doc["wifi_rssi_dbm"] = record.wifiRSSI;
+  doc["wifi_ssid"] = record.connectedSsid != nullptr ? record.connectedSsid : "";
+
+  doc["valve_open"] = record.valveOpen;
+  doc["irrigation_pulse"] = record.irrigationPulse;
+  doc["system_state"] = stateName(record.systemState);
+  doc["decision"] = decisionName(record.decision);
+  doc["decision_reason"] = decisionReason(record.decision);
+  doc["reset_reason"] = record.resetReason;
+
+  payloadOut->remove(0);
+  return serializeJson(doc, *payloadOut) > 0;
+}
+
+bool parseCloudAck(const String& payload, char* errorOut, size_t errorOutSize) {
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    snprintf(errorOut, errorOutSize, "json_%s", error.c_str());
+    return false;
+  }
+
+  JsonVariantConst okValue = doc["ok"];
+  if (okValue.isNull() || !okValue.is<bool>()) {
+    snprintf(errorOut, errorOutSize, "missing_ok");
+    return false;
+  }
+
+  if (!okValue.as<bool>()) {
+    const char* serverError = doc["error"] | "server_rejected";
+    snprintf(errorOut, errorOutSize, "%s", serverError);
+    return false;
+  }
+
+  errorOut[0] = '\0';
+  return true;
+}
+
+bool cloudPostTelemetry(const FutureLogRecord& record) {
+  String payload;
+  if (!buildCloudPayload(record, &payload)) {
+    Serial.println("[CLOUD] PAYLOAD_FAILED");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setCACert(GOOGLE_GTS_ROOT_R1_CA);
+
+  HTTPClient http;
+  http.setTimeout(CLOUD_HTTP_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, GOOGLE_SCRIPT_URL)) {
+    http.end();
+    Serial.println("[CLOUD] HTTP_BEGIN_FAILED");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  Serial.printf("[CLOUD] POST start bytes=%u\n", static_cast<unsigned>(payload.length()));
+  const int httpCode = http.POST(payload);
+
+  bool ok = false;
+  if (httpCode >= 200 && httpCode < 300) {
+    const String response = http.getString();
+    char ackError[48] = "";
+    ok = parseCloudAck(response, ackError, sizeof(ackError));
+    if (ok) {
+      Serial.println("[CLOUD] ACK ok");
+    } else if (strcmp(ackError, "missing_ok") == 0 || strncmp(ackError, "json_", 5) == 0) {
+      Serial.printf("[CLOUD] RESPONSE_INVALID error=%s\n", ackError);
+    } else {
+      Serial.printf("[CLOUD] SERVER_REJECTED error=%s\n", ackError);
+    }
+  } else {
+    Serial.printf("[CLOUD] HTTP code=%d\n", httpCode);
+  }
+
+  http.end();
+  return ok;
+}
+
+bool cloudCanStartNow() {
+  return !valveOpen &&
+         systemState != SystemState::PRE_IRRIGATION &&
+         systemState != SystemState::IRRIGATING;
 }
 
 void handleCloudLogging(unsigned long now) {
@@ -1914,17 +2125,43 @@ void handleCloudLogging(unsigned long now) {
     cloudStatus = Status::OFFLINE;
     return;
   }
-  if (!isConfiguredText(GOOGLE_SCRIPT_URL, "YOUR_GOOGLE_APPS_SCRIPT_URL")) {
+  if (!isCloudConfigured()) {
     cloudStatus = Status::INACTIVE;
+    static bool loggedCloudConfig = false;
+    if (!loggedCloudConfig) {
+      Serial.printf("[CLOUD] endpointConfigured=%s tokenConfigured=%s\n",
+                    (isCloudEndpointConfigured() && isCloudEndpointHttps()) ? "YES" : "NO",
+                    isCloudTokenConfigured() ? "YES" : "NO");
+      loggedCloudConfig = true;
+    }
     return;
   }
-  if (now - lastCloudLogMs < CLOUD_LOG_INTERVAL_MS) return;
-  lastCloudLogMs = now;
+  if (cloudStatus == Status::INACTIVE || cloudStatus == Status::OFFLINE) {
+    cloudStatus = Status::UNKNOWN;
+  }
+  if (nextCloudLogMs == 0) {
+    nextCloudLogMs = bootStartedMs + CLOUD_FIRST_SEND_DELAY_MS;
+  }
+  if (static_cast<long>(now - nextCloudLogMs) < 0) return;
+  if (!cloudCanStartNow()) {
+    Serial.println("[CLOUD] skipped valve/state busy");
+    nextCloudLogMs = now + CLOUD_RETRY_INTERVAL_MS;
+    return;
+  }
 
   FutureLogRecord record;
   buildFutureLogRecord(&record);
 
-  cloudStatus = Status::INACTIVE;
+  lastCloudLogMs = now;
+  const bool ok = cloudPostTelemetry(record);
+  if (ok) {
+    cloudStatus = Status::OK;
+    nextCloudLogMs = now + CLOUD_LOG_INTERVAL_MS;
+  } else {
+    cloudStatus = Status::FAULT;
+    nextCloudLogMs = now + CLOUD_RETRY_INTERVAL_MS;
+    Serial.println("[CLOUD] RETRY scheduled");
+  }
 }
 
 void handleHeartbeat(unsigned long now) {

@@ -3,7 +3,8 @@
 #include <Arduino.h>
 #include <DHT.h>
 
-constexpr char FIRMWARE_VERSION[] = "v15.3.0";
+constexpr char FIRMWARE_VERSION[] = "v15.4.0";
+constexpr char DEVICE_ID[] = "ESP32-HORTA-JBV-01";
 
 constexpr int LED_BUILTIN_PIN = 2;
 constexpr int SOIL_MOISTURE_PIN = 36;
@@ -26,7 +27,7 @@ constexpr uint8_t LCD_I2C_ADDRESS = 0x3F;
 constexpr uint8_t LCD_COLUMNS = 16;
 constexpr uint8_t LCD_ROWS = 2;
 
-constexpr bool ENABLE_CLOUD_LOGGING = false;
+constexpr bool ENABLE_CLOUD_LOGGING = true;
 constexpr bool ENABLE_AUTOMATIC_IRRIGATION = false;
 
 constexpr char WEATHER_LATITUDE[] = "-16.736742064908807";
@@ -56,7 +57,10 @@ constexpr unsigned long BUTTON_TRIPLE_CLICK_MAX_GAP_MS = 650UL;
 constexpr unsigned long BUTTON_TRIPLE_CLICK_WINDOW_MS = 2000UL;
 constexpr unsigned long WEATHER_INTERVAL_MS = 45UL * 60UL * 1000UL;
 constexpr unsigned long WEATHER_RETRY_MS = 5UL * 60UL * 1000UL;
-constexpr unsigned long CLOUD_LOG_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr unsigned long CLOUD_LOG_INTERVAL_MS = 300000UL;
+constexpr unsigned long CLOUD_RETRY_INTERVAL_MS = 60000UL;
+constexpr unsigned long CLOUD_FIRST_SEND_DELAY_MS = 25000UL;
+constexpr uint16_t CLOUD_HTTP_TIMEOUT_MS = 7000;
 constexpr unsigned long PRE_IRRIGATION_MS = 15000UL;
 constexpr unsigned long VALVE_PULSE_MS = 20000UL;
 constexpr unsigned long SOAK_WAIT_MS = 90000UL;
