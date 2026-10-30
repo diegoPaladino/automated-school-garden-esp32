@@ -193,7 +193,9 @@ constexpr uint8_t SOIL_CAL_MEASUREMENT_COUNT = 31;
 constexpr unsigned long SOIL_CAL_SAMPLE_INTERVAL_MS = 250UL;
 constexpr unsigned long SOIL_CAL_RESULT_HOLD_MS = 5000UL;
 
-constexpr char GOOGLE_GTS_ROOT_R1_CA[] PROGMEM = R"EOF(
+// Google roots: https://pki.goog/repository/ (R1 and R4).
+// R4 SHA256: 349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d
+constexpr char GOOGLE_GTS_ROOTS_CA[] PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
 CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
@@ -225,6 +227,19 @@ Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
 2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
 bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
 -----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
+QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
+HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
+9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
+p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
+-----END CERTIFICATE-----
 )EOF";
 
 WifiProfile wifiProfiles[] = {
@@ -253,6 +268,9 @@ bool soilCalibrationValid = false;
 int soilRawDry = 0;
 int soilRawWet = 0;
 uint8_t soilCalibrationVersion = 0;
+uint8_t soilRailSampleCount = 0;
+uint8_t soilRailRecoveryCount = 0;
+bool soilRailFaultActive = false;
 
 char resetReasonText[24] = "UNKNOWN";
 char lcdLineCache[2][17] = {"", ""};
@@ -485,7 +503,8 @@ void closeValve(const char* reason) {
 }
 
 void openValve() {
-  if (!ENABLE_AUTOMATIC_IRRIGATION || soilSensorStatus != Status::OK) {
+  if (!ENABLE_AUTOMATIC_IRRIGATION || soilSensorStatus != Status::OK ||
+      sensors.soilPercent == INVALID_SOIL_PERCENT) {
     closeValve("FAILSAFE");
     return;
   }
@@ -717,11 +736,41 @@ int readSoilFiltered() {
   return static_cast<int>(sum / (SOIL_SAMPLE_COUNT - 4));
 }
 
+bool isSoilAdcRailReading(int raw) {
+  return raw <= SOIL_ADC_RAIL_LOW || raw >= SOIL_ADC_RAIL_HIGH;
+}
+
+void updateSoilRailFault(int filteredRaw) {
+  if (isSoilAdcRailReading(filteredRaw)) {
+    soilRailRecoveryCount = 0;
+    if (soilRailSampleCount < SOIL_RAIL_FAULT_SAMPLES) soilRailSampleCount++;
+    if (!soilRailFaultActive && soilRailSampleCount >= SOIL_RAIL_FAULT_SAMPLES) {
+      soilRailFaultActive = true;
+      Serial.printf("[SOIL] FAULT ADC_RAIL raw=%d\n", filteredRaw);
+    }
+    return;
+  }
+
+  soilRailSampleCount = 0;
+  if (!soilRailFaultActive) {
+    soilRailRecoveryCount = 0;
+    return;
+  }
+
+  if (soilRailRecoveryCount < SOIL_RAIL_RECOVERY_SAMPLES) soilRailRecoveryCount++;
+  if (soilRailRecoveryCount >= SOIL_RAIL_RECOVERY_SAMPLES) {
+    soilRailFaultActive = false;
+    soilRailRecoveryCount = 0;
+    Serial.println("[SOIL] RECOVERED");
+  }
+}
+
 void handleSoil(unsigned long now) {
   if (now - lastSoilReadMs < SOIL_INTERVAL_MS) return;
   lastSoilReadMs = now;
 
   sensors.soilRawFiltered = readSoilFiltered();
+  updateSoilRailFault(sensors.soilRawFiltered);
   if (sensors.soilRawSlow == 0) {
     sensors.soilRawSlow = sensors.soilRawFiltered;
   } else {
@@ -734,6 +783,12 @@ void handleSoil(unsigned long now) {
   } else if (!calibrationSpanValid()) {
     sensors.soilPercent = INVALID_SOIL_PERCENT;
     soilSensorStatus = Status::FAULT;
+  } else if (soilRailFaultActive) {
+    sensors.soilPercent = INVALID_SOIL_PERCENT;
+    soilSensorStatus = Status::FAULT;
+  } else if (isSoilAdcRailReading(sensors.soilRawFiltered)) {
+    sensors.soilPercent = INVALID_SOIL_PERCENT;
+    soilSensorStatus = Status::UNKNOWN;
   } else {
     sensors.soilPercent = soilRawToPercent(sensors.soilRawFiltered);
     soilSensorStatus = Status::OK;
@@ -1112,6 +1167,30 @@ void formatHumanUptime(char* buffer, size_t size) {
   snprintf(buffer, size, "UP: %02lluD%02lluH", days, remainingHours);
 }
 
+void formatCloudScheduleLine(char* buffer, size_t size) {
+  if (!ENABLE_CLOUD_LOGGING || !isCloudConfigured()) {
+    snprintf(buffer, size, "INATIVO");
+    return;
+  }
+
+  if (cloudStatus == Status::OFFLINE) {
+    snprintf(buffer, size, "SEM WIFI");
+    return;
+  }
+
+  if (cloudStatus == Status::FAULT) {
+    unsigned long retrySeconds = 0;
+    unsigned long now = millis();
+    if (static_cast<long>(nextCloudLogMs - now) > 0) {
+      retrySeconds = (nextCloudLogMs - now + 999UL) / 1000UL;
+    }
+    snprintf(buffer, size, "RETRY:%lus", retrySeconds);
+    return;
+  }
+
+  snprintf(buffer, size, "ENVIO:5MIN");
+}
+
 bool readJsonFloat(JsonVariantConst value, float* out) {
   if (value.isNull() || !value.is<float>()) return false;
   float parsed = value.as<float>();
@@ -1219,8 +1298,17 @@ bool parseOpenMeteo(const String& payload) {
   return true;
 }
 
+bool networkRequestsAllowed() {
+  return !valveOpen &&
+         systemState != SystemState::PRE_IRRIGATION &&
+         systemState != SystemState::IRRIGATING &&
+         manualValveTestState == ManualValveTestState::INACTIVE &&
+         !calibrationModeActive();
+}
+
 void handleWeather(unsigned long now) {
   if (systemState == SystemState::BOOT) return;
+  if (!networkRequestsAllowed()) return;
 
   if (wifiStatus != Status::OK) {
     if (weatherStatus != WeatherStatus::WIFI_OFFLINE) weatherStatus = WeatherStatus::WIFI_OFFLINE;
@@ -1375,8 +1463,19 @@ void handleIrrigation(unsigned long now) {
     return;
   }
 
+  if ((soilSensorStatus != Status::OK || sensors.soilPercent == INVALID_SOIL_PERCENT) &&
+      (valveOpen || systemState == SystemState::PRE_IRRIGATION ||
+       systemState == SystemState::IRRIGATING || systemState == SystemState::SOAK_WAIT)) {
+    finishIrrigationCycle("SOIL_INVALID");
+    lastDecision = Decision::BLOCKED_SOIL_INVALID;
+    if (soilSensorStatus == Status::FAULT) setState(SystemState::SENSOR_FAULT);
+    return;
+  }
+
   if (soilSensorStatus == Status::FAULT) {
-    closeValve("SOIL_FAULT");
+    if (valveOpen || systemState != SystemState::SENSOR_FAULT) {
+      closeValve("SOIL_FAULT");
+    }
     setState(SystemState::SENSOR_FAULT);
     lastDecision = Decision::BLOCKED_SOIL_INVALID;
     return;
@@ -1612,13 +1711,7 @@ void displayDeveloperPage(DeveloperDisplayPage page, char* line1, size_t line1Si
 
     case DeveloperDisplayPage::CLOUD:
       snprintf(line1, line1Size, "CLOUD: %s", statusName(cloudStatus));
-      if (!ENABLE_CLOUD_LOGGING || !isCloudConfigured()) {
-        snprintf(line2, line2Size, "INATIVO");
-      } else if (cloudStatus == Status::FAULT) {
-        snprintf(line2, line2Size, "RETRY: 60S");
-      } else {
-        snprintf(line2, line2Size, "ENVIO: 5MIN");
-      }
+      formatCloudScheduleLine(line2, line2Size);
       break;
 
     case DeveloperDisplayPage::DEVICE:
@@ -2074,46 +2167,92 @@ bool cloudPostTelemetry(const FutureLogRecord& record) {
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setCACert(GOOGLE_GTS_ROOT_R1_CA);
+  String response;
+  String redirectLocation;
+  int postCode = 0;
+  {
+    WiFiClientSecure postClient;
+    postClient.setCACert(GOOGLE_GTS_ROOTS_CA);
+    postClient.setHandshakeTimeout(5);
 
-  HTTPClient http;
-  http.setTimeout(CLOUD_HTTP_TIMEOUT_MS);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(client, GOOGLE_SCRIPT_URL)) {
-    http.end();
-    Serial.println("[CLOUD] HTTP_BEGIN_FAILED");
+    HTTPClient postHttp;
+    postHttp.setConnectTimeout(5000);
+    postHttp.setTimeout(CLOUD_HTTP_TIMEOUT_MS);
+    postHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    const char* responseHeaders[] = {"Location"};
+    postHttp.collectHeaders(responseHeaders, 1);
+    if (!postHttp.begin(postClient, GOOGLE_SCRIPT_URL)) {
+      postHttp.end();
+      Serial.println("[CLOUD] POST begin failed");
+      return false;
+    }
+
+    postHttp.addHeader("Content-Type", "application/json");
+    Serial.printf("[CLOUD] POST start bytes=%u\n", static_cast<unsigned>(payload.length()));
+    postCode = postHttp.POST(payload);
+    Serial.printf("[CLOUD] POST code=%d\n", postCode);
+    if (postCode < 0) {
+      char tlsError[128] = "";
+      const int tlsCode = postClient.lastError(tlsError, sizeof(tlsError));
+      Serial.printf("[CLOUD] TLS code=%d detail=%s\n", tlsCode, tlsError);
+    }
+
+    if (postCode >= 200 && postCode < 300) {
+      response = postHttp.getString();
+    } else if (postCode == 301 || postCode == 302 || postCode == 303 ||
+               postCode == 307 || postCode == 308) {
+      redirectLocation = postHttp.header("Location");
+    }
+    postHttp.end();
+  }
+
+  feedWatchdog();
+
+  if (postCode == 301 || postCode == 302 || postCode == 303 ||
+      postCode == 307 || postCode == 308) {
+    if (!redirectLocation.startsWith("https://") || redirectLocation.length() <= 8) {
+      Serial.println("[CLOUD] REDIRECT_INVALID");
+      return false;
+    }
+
+    Serial.println("[CLOUD] ACK redirect GET");
+    WiFiClientSecure getClient;
+    getClient.setCACert(GOOGLE_GTS_ROOTS_CA);
+    getClient.setHandshakeTimeout(5);
+
+    HTTPClient getHttp;
+    getHttp.setConnectTimeout(5000);
+    getHttp.setTimeout(CLOUD_HTTP_TIMEOUT_MS);
+    getHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    if (!getHttp.begin(getClient, redirectLocation)) {
+      getHttp.end();
+      Serial.println("[CLOUD] ACK GET begin failed");
+      return false;
+    }
+
+    const int getCode = getHttp.GET();
+    Serial.printf("[CLOUD] ACK GET code=%d\n", getCode);
+    if (getCode >= 200 && getCode < 300) response = getHttp.getString();
+    getHttp.end();
+    if (getCode < 200 || getCode >= 300) return false;
+  } else if (postCode < 200 || postCode >= 300) {
     return false;
   }
 
-  http.addHeader("Content-Type", "application/json");
-  Serial.printf("[CLOUD] POST start bytes=%u\n", static_cast<unsigned>(payload.length()));
-  const int httpCode = http.POST(payload);
-
-  bool ok = false;
-  if (httpCode >= 200 && httpCode < 300) {
-    const String response = http.getString();
-    char ackError[48] = "";
-    ok = parseCloudAck(response, ackError, sizeof(ackError));
-    if (ok) {
-      Serial.println("[CLOUD] ACK ok");
-    } else if (strcmp(ackError, "missing_ok") == 0 || strncmp(ackError, "json_", 5) == 0) {
-      Serial.printf("[CLOUD] RESPONSE_INVALID error=%s\n", ackError);
-    } else {
-      Serial.printf("[CLOUD] SERVER_REJECTED error=%s\n", ackError);
-    }
+  char ackError[48] = "";
+  const bool ok = parseCloudAck(response, ackError, sizeof(ackError));
+  if (ok) {
+    Serial.println("[CLOUD] ACK ok");
+  } else if (strcmp(ackError, "missing_ok") == 0 || strncmp(ackError, "json_", 5) == 0) {
+    Serial.printf("[CLOUD] RESPONSE_INVALID error=%s\n", ackError);
   } else {
-    Serial.printf("[CLOUD] HTTP code=%d\n", httpCode);
+    Serial.printf("[CLOUD] SERVER_REJECTED error=%s\n", ackError);
   }
-
-  http.end();
   return ok;
 }
 
 bool cloudCanStartNow() {
-  return !valveOpen &&
-         systemState != SystemState::PRE_IRRIGATION &&
-         systemState != SystemState::IRRIGATING;
+  return networkRequestsAllowed();
 }
 
 void handleCloudLogging(unsigned long now) {
@@ -2256,20 +2395,21 @@ void setup() {
 }
 
 void loop() {
-  unsigned long now = millis();
-
   feedWatchdog();
-  handleSensors(now);
-  handleWiFi(now);
+  handleSensors(millis());
+  handleWiFi(millis());
   handleTime();
-  handleWeather(now);
-  handleIrrigation(now);
-  handleButton(now);
-  handleManualValveTest(now);
-  handleCalibrationMode(now);
-  handleDisplay(now);
-  handleCloudLogging(now);
-  handleHeartbeat(now);
-  handleSerialStatus(now);
+  handleButton(millis());
+  handleManualValveTest(millis());
+  handleCalibrationMode(millis());
+  if (manualValveTestState == ManualValveTestState::INACTIVE && !calibrationModeActive()) {
+    handleIrrigation(millis());
+  }
+  handleWeather(millis());
+  feedWatchdog();
+  handleDisplay(millis());
+  handleCloudLogging(millis());
+  handleHeartbeat(millis());
+  handleSerialStatus(millis());
   yield();
 }

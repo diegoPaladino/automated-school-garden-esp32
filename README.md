@@ -4,7 +4,7 @@
 
 Automated School Garden is an ESP32 firmware project for a school irrigation controller. The current revision is focused on safe local operation, observable diagnostics, and a clean PlatformIO workflow suitable for a public embedded/IoT portfolio.
 
-The system is designed to keep running without Wi-Fi or Internet access. Real cloud telemetry is enabled through the deployed Google Apps Script backend, while automatic irrigation remains intentionally disabled by configuration.
+The system is designed to keep running without Wi-Fi or Internet access. Real cloud telemetry is enabled through the deployed Google Apps Script backend, and automatic irrigation is enabled when a valid calibrated soil reading permits it. See [installation and field validation](src/INSTALACAO.md) before unattended operation.
 
 ## Features
 
@@ -49,7 +49,7 @@ DEVELOPER mode is runtime-only and is not persisted to NVS. Every reset starts i
 
 ## Firmware Architecture
 
-The main loop is organized around small cooperative handlers:
+The main loop gives valve control priority over blocking network requests and uses these cooperative handlers:
 
 - `handleSensors()`
 - `handleWiFi()`
@@ -85,6 +85,8 @@ ESP32 -> HTTPS POST -> Google Apps Script Web App -> Google Sheets / email / rep
 
 The ESP32 sends authenticated JSON telemetry to the configured Google Apps Script `/exec` URL. The device token is sent only in the JSON body, never in the URL, query string, LCD, or serial logs. The firmware treats a transmission as successful only when the HTTP request completes and the returned JSON contains `ok: true`.
 
+Production firmware v15.4.4 was built and flashed to the ESP32 on 2026-10-29. Two authenticated telemetry rows were confirmed in Google Sheets exactly 300 seconds apart. This bench validation used disconnected local sensors: invalid local measurements were stored as null with FAULT status, and the valve remained closed. Sensor calibration and water-flow validation on site remain pending.
+
 Normal telemetry runs every 5 minutes. A successful telemetry POST is also the heartbeat; there is no separate heartbeat HTTP request. The external Google Apps Script watchdog can therefore mark the device offline if no successful telemetry row is received for approximately 15 minutes.
 
 If Wi-Fi, DNS, TLS, Google Apps Script, JSON parsing, or token validation fails, the local controller continues to run and a bounded retry is scheduled. Cloud telemetry is skipped while the valve is open or the irrigation state machine is in a time-sensitive valve-actuation phase.
@@ -96,12 +98,12 @@ Implemented:
 - Relay is driven closed at boot before other initialization.
 - Valve closes on soil sensor fault or unknown irrigation state.
 - Maximum valve-open time, pulse limit, cooldown, soak interval, and warning buzzer are preserved.
-- Rain forecast can block irrigation when automatic irrigation is enabled in the future.
+- Rain forecast can block irrigation when automatic irrigation is enabled.
 - Watchdog remains active.
 
-Disabled by design:
+Automatic irrigation configuration:
 
-- `ENABLE_AUTOMATIC_IRRIGATION = false`
+- `ENABLE_AUTOMATIC_IRRIGATION = true` (requires valid soil calibration and readings)
 
 Pending:
 
@@ -138,7 +140,7 @@ Production calibration mode is available on the 16x2 LCD:
 4. Review the candidate dry/wet values on the LCD.
 5. Hold BOOT to save the candidate calibration to NVS.
 
-The candidate stays in RAM until the review/save step. Cancelling or producing an invalid candidate preserves the previous NVS calibration. Long-press during the dry-ready or wet-ready screens cancels calibration. During calibration the valve is kept fail-safe closed and automatic irrigation remains disabled.
+The candidate stays in RAM until the review/save step. Cancelling or producing an invalid candidate preserves the previous NVS calibration. Long-press during the dry-ready or wet-ready screens cancels calibration. During calibration the valve is kept fail-safe closed and automatic irrigation is suspended.
 
 ## Weather Integration
 
@@ -260,5 +262,5 @@ Warning: `r` physically actuates the relay for approximately 500 ms. The passive
 ## Roadmap
 
 - Measure real soil dry/wet calibration values.
-- Confirm the first real ESP32 telemetry row in Google Sheets before enabling backend monitoring.
+- Validate sensor readings and valve water flow on site before unattended operation.
 - Consider persistent offline telemetry buffering in a future scoped change.

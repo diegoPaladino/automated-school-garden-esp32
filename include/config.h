@@ -3,7 +3,7 @@
 #include <Arduino.h>
 #include <DHT.h>
 
-constexpr char FIRMWARE_VERSION[] = "v15.4.0";
+constexpr char FIRMWARE_VERSION[] = "v15.4.4";
 constexpr char DEVICE_ID[] = "ESP32-HORTA-JBV-01";
 
 constexpr int LED_BUILTIN_PIN = 2;
@@ -28,7 +28,7 @@ constexpr uint8_t LCD_COLUMNS = 16;
 constexpr uint8_t LCD_ROWS = 2;
 
 constexpr bool ENABLE_CLOUD_LOGGING = true;
-constexpr bool ENABLE_AUTOMATIC_IRRIGATION = false;
+constexpr bool ENABLE_AUTOMATIC_IRRIGATION = true;
 
 constexpr char WEATHER_LATITUDE[] = "-16.736742064908807";
 constexpr char WEATHER_LONGITUDE[] = "-49.23936484532197";
@@ -39,6 +39,10 @@ constexpr int MIN_CALIBRATION_SPAN = 250;
 constexpr int INVALID_SOIL_PERCENT = -1;
 constexpr int SOIL_START_IRRIGATION_PERCENT = 30;
 constexpr int SOIL_STOP_IRRIGATION_PERCENT = 45;
+constexpr int SOIL_ADC_RAIL_LOW = 5;
+constexpr int SOIL_ADC_RAIL_HIGH = 4090;
+constexpr uint8_t SOIL_RAIL_FAULT_SAMPLES = 3;
+constexpr uint8_t SOIL_RAIL_RECOVERY_SAMPLES = 3;
 
 constexpr int RAIN_PROBABILITY_BLOCK_THRESHOLD = 70;
 constexpr float RAIN_MM_BLOCK_THRESHOLD = 2.0f;
